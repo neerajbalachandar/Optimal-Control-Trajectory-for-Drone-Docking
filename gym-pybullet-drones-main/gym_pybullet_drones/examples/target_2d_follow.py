@@ -123,3 +123,4 @@ def run(drone=DEFAULT_DRONES, num_drones=DEFAULT_NUM_DRONES, physics=DEFAULT_PHY
 
 if __name__ == "__main__":
     run()
+        
