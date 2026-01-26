@@ -7,7 +7,7 @@ from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.utils import sync
 
-from scp_planner_3d import plan_scp_trajectory
+from scp_3d_planner_obstacle import plan_scp_trajectory
 
 def create_spherical_obstacle(p_obs, r_obs, client):
     col = p.createCollisionShape(p.GEOM_SPHERE, radius=r_obs, physicsClientId=client)

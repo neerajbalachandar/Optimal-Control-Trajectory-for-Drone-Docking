@@ -7,7 +7,7 @@ from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.utils import sync
 
-from scp_planner_expanded_state_obstacle import plan_scp_13d
+from scp_planner_expanded_state_no_obstacle import plan_scp_13d
 
 # ----------------------------
 # Quaternion to RPY
