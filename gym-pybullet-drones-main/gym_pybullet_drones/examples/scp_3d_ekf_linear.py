@@ -12,8 +12,8 @@ from gym_pybullet_drones.utils.utils import sync
 # CONFIGURATION
 # ======================================================================
 SIM_FREQ = 240
-CTRL_FREQ = 48
-PLAN_INTERVAL = 0.5     # Request a new plan every 0.5 seconds
+CTRL_FREQ = 24
+PLAN_INTERVAL = 0.4     # Request a new plan every 0.5 seconds
 HORIZON = 15            # Look ahead 1.5s
 DT_PLAN = 0.1           
 

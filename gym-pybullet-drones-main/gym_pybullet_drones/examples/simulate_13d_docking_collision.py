@@ -3,105 +3,92 @@ import numpy as np
 import pybullet as p
 
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
-from gym_pybullet_drones.utils.enums import DroneModel, Physics
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
+from gym_pybullet_drones.utils.enums import DroneModel, Physics
 from gym_pybullet_drones.utils.utils import sync
 
-from scp_13d_dcol_planner import plan_scp_13d_dcol
+from scp_docking_dcol_planner import (
+    solve_initial_docking,
+    solve_scp_dcol,
+    alpha_dcol
+)
 
-# =============================
-# Convex hull definition
-# =============================
+# ----------------------------
+# PARAMETERS
+# ----------------------------
+R_C = 0.25
+R_T = 0.25
+ALPHA_WARN = 1.1
 
-def box_vertices(h):
-    x,y,z = h
-    return np.array([
-        [ x, y, z], [ x,-y, z], [-x,-y, z], [-x, y, z],
-        [ x, y,-z], [ x,-y,-z], [-x,-y,-z], [-x, y,-z]
-    ])
-
-# =============================
-# Simulation
-# =============================
-
+# ----------------------------
 def run():
-
-    p_start = np.array([-1.5, 0, 0.6])
-    q_start = np.array([1,0,0,0])
-    x0 = np.hstack([p_start, np.zeros(3), q_start, np.zeros(3)])
-
+    p0 = np.array([-2.5,0,0.6])
     p_target = np.array([0,0,0.6])
-    q_target = np.array([1,0,0,0])
+    axis = np.array([1,0,0])
 
-    Vc = box_vertices([0.15,0.15,0.05])
-    Vt = box_vertices([0.15,0.15,0.05])
+    N = 120
+    dt = 1/48
 
-    traj = plan_scp_13d_dcol(
-        x0, p_target, q_target, Vc, Vt
-    )
+    # Problem 2
+    x_init = solve_initial_docking(p0, p_target, axis, 20, N, dt)
 
-    # Interpolate for slow sim
-    T = traj.shape[1]
-    t_dense = np.linspace(0,1,10*T)
-    traj_dense = np.vstack([
-        np.interp(t_dense, np.linspace(0,1,T), traj[i])
-        for i in range(traj.shape[0])
-    ])
+    # Problem 3
+    x_plan = solve_scp_dcol(x_init, p_target, R_C, R_T, N, dt)
 
     env = CtrlAviary(
         drone_model=DroneModel.CF2X,
         num_drones=2,
-        initial_xyzs=np.array([p_start,p_target]),
+        initial_xyzs=np.array([p0,p_target]),
         initial_rpys=np.zeros((2,3)),
         physics=Physics.PYB,
-        gui=True
+        gui=True,
+        ctrl_freq=48,
+        pyb_freq=240
     )
 
     client = env.getPyBulletClient()
 
-    # Visual hulls (non-colliding)
     hull_vis = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=[0.15,0.15,0.05],
-        rgbaColor=[0,0,1,0.25],
+        p.GEOM_SPHERE, radius=R_C,
+        rgbaColor=[0,0,1,0.3],
         physicsClientId=client
     )
-
-    hull_ids = [
-        p.createMultiBody(0,-1,hull_vis,[0,0,0]),
-        p.createMultiBody(0,-1,hull_vis,[0,0,0])
-    ]
+    hull_c = p.createMultiBody(0,-1,hull_vis,p0)
 
     ctrl = [DSLPIDControl(drone_model=DroneModel.CF2X) for _ in range(2)]
     action = np.zeros((2,4))
     START = time.time()
 
-    for k in range(traj_dense.shape[1]):
-
+    for k in range(x_plan.shape[1]):
         obs,_,_,_,_ = env.step(action)
 
-        for i in range(2):
-            pos, orn = p.getBasePositionAndOrientation(env.DRONE_IDS[i])
-            p.resetBasePositionAndOrientation(
-                hull_ids[i], pos, orn, physicsClientId=client
-            )
+        p_c = obs[0][0:3]
+        alpha = alpha_dcol(p_c, p_target, R_C, R_T)
+
+        # Runtime α-supervisor
+        if alpha < ALPHA_WARN:
+            print(f"α warning {alpha:.2f} → replanning")
+            x_init = solve_initial_docking(p_c, p_target, axis, 20, N, dt)
+            x_plan = solve_scp_dcol(x_init, p_target, R_C, R_T, N, dt)
+            k = 0
+            continue
+
+        p.resetBasePositionAndOrientation(hull_c, p_c, [0,0,0,1])
 
         action[0],_,_ = ctrl[0].computeControlFromState(
-            env.CTRL_TIMESTEP,
-            obs[0],
-            traj_dense[0:3,k],
-            np.zeros(3)
+            env.CTRL_TIMESTEP, obs[0], x_plan[0:3,k], np.zeros(3)
         )
-
         action[1],_,_ = ctrl[1].computeControlFromState(
-            env.CTRL_TIMESTEP,
-            obs[1],
-            p_target,
-            np.zeros(3)
+            env.CTRL_TIMESTEP, obs[1], p_target, np.zeros(3)
         )
 
         env.render()
         sync(k, START, env.CTRL_TIMESTEP)
+
+        # docking convergence
+        if np.linalg.norm(p_c - p_target) < 0.03 and alpha >= 1.0:
+            print("Docking complete and safe.")
+            break
 
     env.close()
 
