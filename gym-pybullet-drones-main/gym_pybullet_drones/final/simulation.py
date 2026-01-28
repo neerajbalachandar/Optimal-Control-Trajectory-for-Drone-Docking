@@ -1,4 +1,4 @@
-# unified_docking_simulation.py
+# docking_simulation.py
 
 import time
 import numpy as np
@@ -10,7 +10,7 @@ from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.utils import sync
 
 from gym_pybullet_drones.final.dcol import *
-from gym_pybullet_drones.final.target_prediction import *
+from gym_pybullet_drones.final.target_prediction_linear import *
 from gym_pybullet_drones.final.scp_planner import *
 from gym_pybullet_drones.final.downwash_model import * 
 
@@ -24,7 +24,7 @@ HORIZON        = 25
 DT_PLAN        = 1 / CTRL_FREQ
 PLAN_INTERVAL  = 0.4
 
-SAFETY_R       = 0.35
+SAFETY_R       = 0.1
 ALPHA_LIMIT    = 1.05
 
 
@@ -35,7 +35,7 @@ def run():
     # --------------------------------------------------------
     CHASER_START = np.array([-2.5, 0.0, 1.2])
 
-    target_model = UnstableHoverTarget()
+    target_model = LinearTarget()
     ekf = TargetEKF(dt=DT)
     ekf.x = target_model.get_state(0.0)
 
