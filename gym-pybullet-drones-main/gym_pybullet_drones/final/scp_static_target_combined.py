@@ -12,7 +12,7 @@ from gym_pybullet_drones.utils.utils import sync
 # ======================================================================
 # 0. CONFIGURATION & CONSTANTS
 # ======================================================================
-DOCKING_AXIS = np.array([0.0, 0.0, -1.0]) 
+DOCKING_AXIS = np.array([0.0, 0.0,-1.0]) 
 CONE_ANGLE   = 30    # Degrees
 DURATION_SEC = 20    # Time for trajectory
 SAFETY_R     = 0.1   # Safety Radius (Hull size)
@@ -78,7 +78,7 @@ def plan_scp_docking(p_start, v_start, p_goal, p_obs, r_obs, docking_axis, cone_
             x_ref[0:3, k] = (1 - alpha) * p_start + alpha * p_entry
             # Add a small Z-hop to clear low obstacles if starting far away
             if np.linalg.norm(p_start - p_entry) > 1.0:
-                x_ref[2, k] += 1.0 * np.sin(np.pi * alpha)
+                x_ref[2, k] += 0.5 * np.sin(np.pi * alpha)
             # Vel
             x_ref[3:6, k] = v_start * (1 - alpha) # Decay initial velocity
         else:
@@ -188,9 +188,9 @@ def draw_planned_path(traj, client, target_pos, axis, angle):
 
 def create_spherical_obstacle(p_obs, r_obs, client):
     col = p.createCollisionShape(p.GEOM_SPHERE, radius=r_obs, physicsClientId=client)
-    vis = p.createVisualShape(p.GEOM_SPHERE, radius=r_obs, rgbaColor=[1,0,0,0.4], physicsClientId=client)
+    vis = p.createVisualShape(p.GEOM_SPHERE, radius=r_obs, rgbaColor=[1,0,0,0.8], physicsClientId=client)
     p.createMultiBody(0, col, vis, p_obs, physicsClientId=client)
-
+    
 def visualize_docking_cone(p_goal, axis, angle_deg, length=2.0, client=0):
     axis = axis / np.linalg.norm(axis)
     cone_dir_main = -axis 
@@ -202,15 +202,16 @@ def visualize_docking_cone(p_goal, axis, angle_deg, length=2.0, client=0):
     u = np.cross(axis, ref); u = u/np.linalg.norm(u)
     v = np.cross(axis, u)
     
-    # Draw Rim
+    # Draw Rim (Green)
     for phi in np.linspace(0, 2*np.pi, 12):
         radial = u*np.cos(phi) + v*np.sin(phi)
         vec = cone_dir_main * np.cos(theta) + radial * np.sin(theta)
         end_pos = p_goal + vec * length
         p.addUserDebugLine(p_goal, end_pos, [0,1,0], 2, physicsClientId=client)
     
-    # Draw Center Axis
-    p.addUserDebugLine(p_goal, p_goal + cone_dir_main*length, [0,1,0], 4, physicsClientId=client)
+    # Draw Center Axis (RED & THICK)
+    p.addUserDebugLine(p_goal, p_goal + cone_dir_main*length, [1,0,0], 5, physicsClientId=client)
+    
 
 # ======================================================================
 # 4. MAIN INTEGRATED EXECUTION
@@ -234,6 +235,8 @@ def run():
         p_goal=TARGET_POS,
         p_obs=P_OBS,
         r_obs=R_OBS + 0.2,
+        # r_obs=R_OBS ,
+        
         docking_axis=DOCKING_AXIS,
         cone_angle_deg=CONE_ANGLE,
         N=int(CTRL_FREQ * DURATION_SEC),
@@ -247,12 +250,17 @@ def run():
         initial_xyzs=np.array([CHASER_START, TARGET_POS]),
         initial_rpys=np.zeros((2,3)),
         physics=Physics.PYB_DW,   # <--- DOWNWASH ENABLED
-        neighbourhood_radius=0.3,
+        neighbourhood_radius=0.2,
         pyb_freq=SIM_FREQ,
         ctrl_freq=CTRL_FREQ,
         gui=True,
         obstacles=False
     )
+    
+    
+
+       
+       
     PYB_CLIENT = env.getPyBulletClient()
 
     # 3. VISUALS SETUP
@@ -374,6 +382,8 @@ def run():
                 v_start=v_chaser, 
                 p_goal=TARGET_POS, 
                 p_obs=P_OBS, r_obs=R_OBS+ 0.2,
+                # p_obs=P_OBS, r_obs=R_OBS,
+                
                 docking_axis=DOCKING_AXIS, cone_angle_deg=CONE_ANGLE,
                 N=int(CTRL_FREQ * 15), dt=1/CTRL_FREQ # Shorter horizon for re-approach
             )
