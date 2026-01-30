@@ -12,8 +12,8 @@ from gym_pybullet_drones.utils.utils import sync
 # 0. CONFIGURATION
 # ======================================================================
 SIM_FREQ = 240
-CTRL_FREQ = 48
-PLAN_INTERVAL = 0.2     # Fast planning (5Hz)
+CTRL_FREQ = 120
+PLAN_INTERVAL = 0.1     # Fast planning (5Hz)
 HORIZON = 20            # Long horizon (2.0s) to see the floor intersection
 DT_PLAN = 0.1           
 DURATION_SEC = 15.0     
@@ -22,11 +22,11 @@ DURATION_SEC = 15.0
 DOCKING_AXIS = np.array([0.0, 0.0, -1.0]) 
 CONE_ANGLE   = 30    # Degrees
 SAFETY_R     = 0.1   # Safety Radius (Hull size)
-ALPHA_LIMIT  = 1.05  # Collision Trigger Threshold
+ALPHA_LIMIT  = 1.0  # Collision Trigger Threshold
 
 # Wind
-WIND_NOMINAL  = np.array([0.5, -0.3, -0.1]) 
-WIND_GUST_AMP = 0.1                         
+WIND_NOMINAL  = np.array([0.0, -0.0, -0.0]) 
+WIND_GUST_AMP = 0.0            
 
 # FSM States
 STATE_TRACKING    = 0
@@ -40,8 +40,8 @@ class ProjectileTarget:
     def get_state(self, t):
         s = np.zeros(6)
         x_0 = 0.0
-        z_0 = 1.5  # Start higher to give Chaser a chance
-        vx = 0.3
+        z_0 = 1.8  # Start higher to give Chaser a chance
+        vx = 0.15
         g = 0.1
         
         # Ballistic trajectory
@@ -106,10 +106,10 @@ def draw_dynamic_cone(center, axis, angle_deg, client):
         radial = u*np.cos(phi) + v*np.sin(phi)
         vec = cone_dir * np.cos(theta) + radial * np.sin(theta)
         end = center + vec * length
-        p.addUserDebugLine(center, end, [0,1,0], 1, lifeTime=0.1, physicsClientId=client)
+        p.addUserDebugLine(center, end, [0,1,0], 1, physicsClientId=client)
     
     # Capture Vector (Red & Thick)
-    p.addUserDebugLine(center, center + cone_dir*length, [1,0,0], 4, lifeTime=0.1, physicsClientId=client)
+    p.addUserDebugLine(center, center + cone_dir*length, [1,0,0], 4, physicsClientId=client)
 
 # ======================================================================
 # 4. ASYNC PLANNER (Dive + Cone)

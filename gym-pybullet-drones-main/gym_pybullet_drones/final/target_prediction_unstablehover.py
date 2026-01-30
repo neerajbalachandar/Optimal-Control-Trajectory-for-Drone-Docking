@@ -11,6 +11,8 @@ from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.utils import sync
 
+from gym_pybullet_drones.final.scp_planner import *
+
 
 class UnstableHoverTarget:
     def get_state(self, t):
@@ -57,159 +59,98 @@ class TargetEKF:
         return fut
     
 class AsyncPlanner(threading.Thread):
-    def __init__(self, N, dt, p_obs, r_obs):
+    """
+    Asynchronous wrapper around plan_scp_docking()
+
+    - No SCP math here
+    - Pure scheduling + warm-start logic
+    """
+
+    def __init__(
+        self,
+        N,
+        dt,
+        p_obs,
+        r_obs,
+        docking_axis,
+        cone_angle_deg
+    ):
         super().__init__()
+        self.daemon = True
+
+        # Planning params
         self.N = N
         self.dt = dt
         self.p_obs = p_obs
-        self.r_obs_safe = r_obs + 0.25
+        self.r_obs = r_obs
+        self.docking_axis = docking_axis
+        self.cone_angle_deg = cone_angle_deg
 
-        self.daemon = True
-        self.lock = threading.Lock()
+        # Thread-safe buffers
+        self._lock = threading.Lock()
+        self._request = None   # (chaser_pos, target_pred_traj)
+        self._solution = None  # (N,3)
 
-        self.req = None          # (chaser_state, target_preds)
-        self.res = None          # planned trajectory
-        self.prev_sol = None     # warm start
-
-        # Discrete double-integrator dynamics
-        self.A = np.eye(6)
-        self.A[0,3] = dt
-        self.A[1,4] = dt
-        self.A[2,5] = dt
-
-        self.B = np.zeros((6,3))
-        self.B[0,0] = 0.5 * dt**2
-        self.B[1,1] = 0.5 * dt**2
-        self.B[2,2] = 0.5 * dt**2
-        self.B[3,0] = dt
-        self.B[4,1] = dt
-        self.B[5,2] = dt
-
-    # --------------------------------------------------
-    # Public API (USED BY SIMULATION)
-    # --------------------------------------------------
+    # --------------------------------------------------------
+    # Public API (used by simulation)
+    # --------------------------------------------------------
     def request(self, chaser_state, target_preds):
-        with self.lock:
-            self.req = (chaser_state, target_preds)
+        """
+        chaser_state : (6,)  [pos, vel]
+        target_preds : (N,6) predicted target states
+        """
+        with self._lock:
+            self._request = (chaser_state.copy(), target_preds.copy())
 
     def get(self):
-        with self.lock:
-            return self.res
+        """Returns latest planned trajectory or None"""
+        with self._lock:
+            return None if self._solution is None else self._solution.copy()
 
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # Thread loop
-    # --------------------------------------------------
+    # --------------------------------------------------------
     def run(self):
         while True:
-            data = None
-            with self.lock:
-                if self.req is not None:
-                    data = self.req
-                    self.req = None
 
-            if data is not None:
-                try:
-                    traj = self._solve_scp(data[0], data[1])
-                    with self.lock:
-                        self.res = traj
-                except Exception as e:
-                    print(f"[SCP ERROR] {e}")
+            with self._lock:
+                data = self._request
+                self._request = None
 
-            time.sleep(0.01)
+            if data is None:
+                time.sleep(0.01)
+                continue
 
-    # --------------------------------------------------
-    # Initial guess generation (CRITICAL)
-    # --------------------------------------------------
-    def _generate_guess(self, start_pos, goal_pos):
-        ref = np.zeros((6, self.N))
+            chaser_state, target_preds = data
 
-        vec = goal_pos - start_pos
-        dist = np.linalg.norm(vec)
+            try:
+                traj = self._solve(chaser_state, target_preds)
+                with self._lock:
+                    self._solution = traj
+            except Exception as e:
+                print(f"[AsyncPlanner] SCP failed: {e}")
 
-        obs_vec = self.p_obs - start_pos
-        proj = np.dot(obs_vec, vec/dist) if dist > 1e-3 else 0.0
+    # --------------------------------------------------------
+    # Core solver wrapper
+    # --------------------------------------------------------
+    def _solve(self, chaser_state, target_preds):
+        """
+        Calls the offline SCP planner with a moving target.
+        """
 
-        blocked = (
-            0.0 < proj < dist and
-            np.linalg.norm(start_pos + proj * (vec/dist) - self.p_obs) < self.r_obs_safe
+        p_start = chaser_state[0:3]
+        p_goal  = target_preds[-1, 0:3]   # terminal predicted target pose
+
+        traj = plan_scp_docking(
+            p_start=p_start,
+            p_goal=p_goal,
+            p_obs=self.p_obs,
+            r_obs=self.r_obs,
+            docking_axis=self.docking_axis,
+            cone_angle_deg=self.cone_angle_deg,
+            N=self.N,
+            dt=self.dt
         )
 
-        if blocked:
-            safe_pt = self.p_obs.copy()
-            safe_pt[1] -= 1.5
-
-            mid = self.N // 2
-            for k in range(self.N):
-                if k < mid:
-                    a = k / mid
-                    ref[0:3, k] = (1 - a) * start_pos + a * safe_pt
-                else:
-                    a = (k - mid) / (self.N - mid - 1)
-                    ref[0:3, k] = (1 - a) * safe_pt + a * goal_pos
-        else:
-            for k in range(self.N):
-                a = k / (self.N - 1)
-                ref[0:3, k] = (1 - a) * start_pos + a * goal_pos
-
-        return ref
-
-    # --------------------------------------------------
-    # SCP SOLVER
-    # --------------------------------------------------
-    def _solve_scp(self, chaser_state, preds):
-
-        if self.prev_sol is None:
-            x_ref = self._generate_guess(
-                chaser_state[0:3],
-                preds[-1, 0:3]
-            )
-        else:
-            x_ref = np.zeros((6, self.N))
-            x_ref[:, :-1] = self.prev_sol[:, 1:]
-            x_ref[:, -1]  = preds[-1]
-
-        for _ in range(3):
-            x = cp.Variable((6, self.N))
-            u = cp.Variable((3, self.N - 1))
-            slack = cp.Variable(self.N, nonneg=True)
-
-            dock = np.array([-0.1, 0.0, 0.0])
-            cost = 0.0
-
-            con = [x[:,0] == chaser_state]
-
-            for k in range(self.N - 1):
-                con += [x[:,k+1] == self.A @ x[:,k] + self.B @ u[:,k]]
-
-                w = 0.95 ** k
-                cost += w * 50.0 * cp.sum_squares(
-                    x[0:3, k+1] - (preds[k+1, 0:3] + dock)
-                )
-                cost += 0.01 * cp.sum_squares(u[:,k])
-
-            for k in range(1, self.N):
-                vec = x_ref[0:3, k] - self.p_obs
-                dist = np.linalg.norm(vec)
-                n = vec / dist if dist > 1e-3 else np.array([0, 1, 0])
-
-                con += [
-                    n @ (x[0:3, k] - self.p_obs)
-                    >= self.r_obs_safe - slack[k]
-                ]
-                con += [cp.norm(x[:,k] - x_ref[:,k]) <= 0.5]
-
-            cost += 1e6 * cp.sum(slack)
-
-            prob = cp.Problem(cp.Minimize(cost), con)
-            try:
-                prob.solve(solver=cp.OSQP)
-            except:
-                prob.solve(solver=cp.SCS)
-
-            if x.value is None:
-                break
-
-            x_ref = x.value
-
-        self.prev_sol = x_ref
-        return x_ref
+        # traj shape: (N,3)
+        return traj

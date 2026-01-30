@@ -16,11 +16,11 @@ DOCKING_AXIS = np.array([0.0, 0.0, -1.0])
 CONE_ANGLE   = 30    # Degrees
 DURATION_SEC = 20    # Time for trajectory
 SAFETY_R     = 0.1   # Safety Radius (Hull size)
-ALPHA_LIMIT  = 1.05  # Collision Trigger Threshold (Distance/Radius ratio)
+ALPHA_LIMIT  = 0.9  # Collision Trigger Threshold (Distance/Radius ratio)
 
 # Wind Configuration
-WIND_NOMINAL  = np.array([0.5, -0.3, -0.1]) # Constant drift
-WIND_GUST_AMP = 0.1                         # Random noise magnitude
+WIND_NOMINAL  = np.array([0.0, -0.0, -0.0]) # Constant drift
+WIND_GUST_AMP = 0.0                         # Random noise magnitude
 
 # FSM States
 STATE_TRACKING    = 0
@@ -188,29 +188,82 @@ def draw_planned_path(traj, client, target_pos, axis, angle):
 
 def create_spherical_obstacle(p_obs, r_obs, client):
     col = p.createCollisionShape(p.GEOM_SPHERE, radius=r_obs, physicsClientId=client)
-    vis = p.createVisualShape(p.GEOM_SPHERE, radius=r_obs, rgbaColor=[1,0,0,0.4], physicsClientId=client)
+    vis = p.createVisualShape(p.GEOM_SPHERE, radius=r_obs, rgbaColor=[1,0,0,0.8], physicsClientId=client)
     p.createMultiBody(0, col, vis, p_obs, physicsClientId=client)
 
 def visualize_docking_cone(p_goal, axis, angle_deg, length=2.0, client=0):
     axis = axis / np.linalg.norm(axis)
-    cone_dir_main = -axis 
+    cone_dir_main = -axis
     theta = np.deg2rad(angle_deg)
-    
-    # Construct Basis
-    if np.abs(axis[2]) < 0.9: ref = np.array([0,0,1])
-    else: ref = np.array([0,1,0])
-    u = np.cross(axis, ref); u = u/np.linalg.norm(u)
+
+    # Construct Basis (unchanged)
+    if np.abs(axis[2]) < 0.9:
+        ref = np.array([0, 0, 1])
+    else:
+        ref = np.array([0, 1, 0])
+    u = np.cross(axis, ref); u = u / np.linalg.norm(u)
     v = np.cross(axis, u)
+
+    # Resolution parameters (ONLY visual)
+    n_phi = 30     # circumferential resolution
+    n_z   = 15     # axial resolution
+    color = [0.2, 0.8, 0.2]  # soft green, visually translucent
+
+
+    # Draw hollow cone surface
+    for i in range(n_z):
+        z0 = (i / n_z) * length
+        z1 = ((i + 1) / n_z) * length
+
+        r0 = z0 * np.tan(theta)
+        r1 = z1 * np.tan(theta)
+
+        center0 = p_goal + cone_dir_main * z0
+        center1 = p_goal + cone_dir_main * z1
+
+        for phi in np.linspace(0, 2*np.pi, n_phi, endpoint=False):
+            radial = u * np.cos(phi) + v * np.sin(phi)
+
+            p0 = center0 + radial * r0
+            p1 = center1 + radial * r1
+
+            # Longitudinal surface lines
+            p.addUserDebugLine(
+                p0, p1,
+                color,
+                lineWidth=1.5,
+                physicsClientId=client
+            )
+
+    # Draw base circle (optional but helps perception)
+    z_base = length
+    r_base = z_base * np.tan(theta)
+    center_base = p_goal + cone_dir_main * z_base
+
+    prev_pt = None
+    for phi in np.linspace(0, 2*np.pi, n_phi + 1):
+        radial = u * np.cos(phi) + v * np.sin(phi)
+        pt = center_base + radial * r_base
+        if prev_pt is not None:
+            p.addUserDebugLine(
+                prev_pt, pt,
+                color,
+                lineWidth=1.5,
+                physicsClientId=client
+            )
+        prev_pt = pt
+
     
-    # Draw Rim
-    for phi in np.linspace(0, 2*np.pi, 12):
-        radial = u*np.cos(phi) + v*np.sin(phi)
-        vec = cone_dir_main * np.cos(theta) + radial * np.sin(theta)
-        end_pos = p_goal + vec * length
-        p.addUserDebugLine(p_goal, end_pos, [0,1,0], 2, physicsClientId=client)
-    
-    # Draw Center Axis
-    p.addUserDebugLine(p_goal, p_goal + cone_dir_main*length, [0,1,0], 4, physicsClientId=client)
+    p.addUserDebugLine(
+        p_goal,
+        p_goal + cone_dir_main * length,
+        [1, 0, 0],
+        4,
+        physicsClientId=client
+    )
+
+
+
 
 # ======================================================================
 # 4. MAIN INTEGRATED EXECUTION
@@ -246,8 +299,8 @@ def run():
         num_drones=2,
         initial_xyzs=np.array([CHASER_START, TARGET_POS]),
         initial_rpys=np.zeros((2,3)),
-        physics=Physics.PYB_DW,   # <--- DOWNWASH ENABLED
-        neighbourhood_radius=0.3,
+        physics=Physics.PYB,   # <--- DOWNWASH ENABLED
+        neighbourhood_radius=10, #downwash radius
         pyb_freq=SIM_FREQ,
         ctrl_freq=CTRL_FREQ,
         gui=True,

@@ -77,7 +77,7 @@ def plan_scp_docking(p_start, p_goal, p_obs, r_obs, docking_axis, cone_angle_deg
             constraints += [n_obs_vec @ (x[0:3,k] - p_obs) >= r_obs - slack_obs[k]]
 
             # Docking Cone (Enforced ONLY in Phase 2)
-            if k > split_idx:
+            if k > split_idx+2:
                 p_rel = x[0:3,k] - p_goal 
                 # Distance "along" the cone axis (should be positive away from goal)
                 # We want p_rel to be in direction of -n_approach
@@ -88,7 +88,7 @@ def plan_scp_docking(p_start, p_goal, p_obs, r_obs, docking_axis, cone_angle_deg
 
         # Trust Region
         for k in range(N):
-            constraints += [cp.norm(x[:,k] - x_ref[:,k]) <= 1.0]
+            constraints += [cp.norm(x[:,k] - x_ref[:,k]) <= 2.5]
 
         prob = cp.Problem(cp.Minimize(cost), constraints)
         
@@ -126,24 +126,42 @@ def create_spherical_obstacle(p_obs, r_obs, client):
     vis = p.createVisualShape(p.GEOM_SPHERE, radius=r_obs, rgbaColor=[1,0,0,0.4], physicsClientId=client)
     p.createMultiBody(0, col, vis, p_obs, physicsClientId=client)
 
-def visualize_docking_cone(p_goal, axis, angle_deg, length=2.0, client=0):
+def draw_moving_docking_cone(p_goal, axis, angle_deg, length, client):
     axis = axis / np.linalg.norm(axis)
-    # Cone opens in direction -axis
-    cone_dir_main = -axis 
+    cone_dir = -axis
     theta = np.deg2rad(angle_deg)
-    
-    # Basis
-    if np.abs(axis[2]) < 0.9: ref = np.array([0,0,1])
-    else: ref = np.array([0,1,0])
-    u = np.cross(axis, ref); u = u/np.linalg.norm(u)
+
+    # Orthonormal basis
+    if abs(axis[2]) < 0.9:
+        ref = np.array([0, 0, 1])
+    else:
+        ref = np.array([0, 1, 0])
+
+    u = np.cross(axis, ref)
+    u /= np.linalg.norm(u)
     v = np.cross(axis, u)
-    
-    # Draw rim
-    for phi in np.linspace(0, 2*np.pi, 12):
+
+    debug_ids = []
+
+    # Cone surface
+    for phi in np.linspace(0, 2*np.pi, 24):
         radial = u*np.cos(phi) + v*np.sin(phi)
-        vec = cone_dir_main * np.cos(theta) + radial * np.sin(theta)
-        end_pos = p_goal + vec * length
-        p.addUserDebugLine(p_goal, end_pos, [0,1,0], 2, physicsClientId=client)
-    
-    # Draw Axis
-    p.addUserDebugLine(p_goal, p_goal + cone_dir_main*length, [0,1,0], 4, physicsClientId=client)
+        vec = cone_dir*np.cos(theta) + radial*np.sin(theta)
+        end = p_goal + vec * length
+
+        uid = p.addUserDebugLine(
+            p_goal, end,
+            [0, 1, 0], 2,
+            physicsClientId=client
+        )
+        debug_ids.append(uid)
+
+    # Axis
+    uid = p.addUserDebugLine(
+        p_goal, p_goal + cone_dir*length,
+        [0, 1, 0], 4,
+        physicsClientId=client
+    )
+    debug_ids.append(uid)
+
+    return debug_ids
