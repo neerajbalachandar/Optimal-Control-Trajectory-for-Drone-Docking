@@ -46,23 +46,27 @@ class ProjectileTarget:
         # Initial Conditions
         x_0 = 0.5
         z_0 = 2.0
-        vx  = 0.4  # High horizontal speed
-        g   = 0.2  # Low gravity (floaty/less vertical drop)
+        
+        # MODIFICATIONS:
+        # Move slowly: vx is low (0.1 to 0.2)
+        # Range >> Depth: g must be extremely small relative to vx
+        vx  = 0.15   # Reduced from 0.5 for "very slow" motion
+        g   = 0.005  # Reduced from 0.05 to make it "super floaty" 
         
         # Projectile Physics
-        s[0] = x_0 + vx * t          # X: Linear increase
-        s[1] = 0.0                   # Y: Constant
-        s[2] = z_0 - 0.5 * g * t**2  # Z: Slow parabolic drop
+        s[0] = x_0 + vx * t          # X: Linear increase (Slow)
+        s[1] = 0.0                   
+        s[2] = z_0 - 0.5 * g * t**2  # Z: Parabolic drop (Extremely slow)
         
-        # Floor clamp (prevent going underground)
+        # Floor clamp
         if s[2] < 0.05:
             s[2] = 0.05
             s[5] = 0.0
         else:
-            s[5] = -g * t  # Vz
+            s[5] = -g * t  
             
-        s[3] = vx      # Vx
-        s[4] = 0.0     # Vy
+        s[3] = vx      
+        s[4] = 0.0     
         
         return s
 

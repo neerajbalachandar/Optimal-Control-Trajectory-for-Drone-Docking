@@ -7,6 +7,9 @@ from gym_pybullet_drones.utils.enums import DroneModel, Physics
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.utils import sync
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
 
 # ======================================================================
 # 0. CONFIGURATION
@@ -28,7 +31,7 @@ ALPHA_LIMIT  = 1.05
 
 # Wind
 WIND_NOMINAL  = np.array([0.5, -0.3, -0.1]) 
-WIND_GUST_AMP = 0.1                         
+WIND_GUST_AMP = 0.05                         
 
 # FSM States
 STATE_TRACKING    = 0
@@ -41,7 +44,7 @@ STATE_REPLANNING  = 2
 class SuddenTurnTarget:
     def get_state(self, t):
         s = np.zeros(6)
-        speed = 0.15 # Increased speed slightly to test lag handling
+        speed = 0.05 # Increased speed slightly to test lag handling
         
         if t < TURN_TIME:
             # Phase 1: Move +X
@@ -250,6 +253,75 @@ class AsyncPlanner(threading.Thread):
 
         self.prev_sol = x_ref
         return x_ref
+    
+    
+    
+def plot_performance(history):
+    t = np.array(history['t'])
+    p_c = np.array(history['p_c'])
+    p_t = np.array(history['p_t'])
+    v_c = np.array(history['v_c'])
+    act = np.array(history['action'])
+    
+    # Calculate tracking error norm over time
+    err = np.linalg.norm(p_c - p_t, axis=1)
+
+    fig = plt.figure(figsize=(15, 10))
+    
+    # 1. 3D Trajectory
+    ax1 = fig.add_subplot(2, 3, 1, projection='3d')
+    ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
+    ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
+    ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
+    ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
+    ax1.set_title("3D Trajectory")
+    ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+    ax1.legend()
+
+    # 2. Position X, Y, Z vs Time
+    ax2 = fig.add_subplot(2, 3, 2)
+    ax2.plot(t, p_t[:,0], 'g--', alpha=0.5)
+    ax2.plot(t, p_c[:,0], 'b-', label='X')
+    ax2.plot(t, p_t[:,1], 'g--', alpha=0.5)
+    ax2.plot(t, p_c[:,1], 'r-', label='Y')
+    ax2.plot(t, p_t[:,2], 'g--', alpha=0.5)
+    ax2.plot(t, p_c[:,2], 'k-', label='Z')
+    ax2.set_title("Position Evolution (Target dashed)")
+    ax2.grid(True)
+    ax2.legend()
+
+    # 3. Docking Error (Distance)
+    ax3 = fig.add_subplot(2, 3, 3)
+    ax3.plot(t, err, 'r-', linewidth=2)
+    ax3.axhline(0.10, color='k', linestyle=':', label='Dock Threshold')
+    ax3.set_title("Euclidean Distance to Target")
+    ax3.set_xlabel("Time (s)")
+    ax3.set_ylabel("Distance (m)")
+    ax3.grid(True)
+    ax3.legend()
+
+    # 4. Velocity
+    ax4 = fig.add_subplot(2, 3, 4)
+    ax4.plot(t, v_c[:,0], label='Vx')
+    ax4.plot(t, v_c[:,1], label='Vy')
+    ax4.plot(t, v_c[:,2], label='Vz')
+    ax4.set_title("Chaser Velocities")
+    ax4.grid(True)
+    ax4.legend()
+
+    # 5. Control Actions (RPM/Thrust)
+    ax5 = fig.add_subplot(2, 3, (5, 6))
+    ax5.plot(t, act[:,0], label='M1')
+    ax5.plot(t, act[:,1], label='M2')
+    ax5.plot(t, act[:,2], label='M3')
+    ax5.plot(t, act[:,3], label='M4')
+    ax5.set_title("Control Inputs (RPM/Thrust)")
+    ax5.set_xlabel("Time (s)")
+    ax5.grid(True)
+    ax5.legend(loc='upper right', ncol=4)
+
+    plt.tight_layout()
+    plt.show()
 
 # ======================================================================
 # 5. MAIN EXECUTION
@@ -300,6 +372,12 @@ def run():
     print("[SIM] Running Sudden Turn with 2-Phase Docking...")
     START = time.time()
     
+    history = {
+        't': [], 
+        'p_c': [], 'p_t': [], 
+        'v_c': [], 'action': []
+    }
+    
     for t in np.arange(0, DURATION_SEC, 0.1):
         p.addUserDebugLine(target_gen.get_state(t)[0:3], target_gen.get_state(t+0.1)[0:3], [0.5, 0, 0.5], 2, physicsClientId=PYB)
     
@@ -317,6 +395,16 @@ def run():
         # 1. Physics
         obs, _, _, _, _ = env.step(action)
         true_state = target_gen.get_state(sim_t)
+        
+        
+        
+        history['t'].append(sim_t)
+        history['p_c'].append(obs[0][0:3])
+        history['p_t'].append(true_state[0:3])
+        history['v_c'].append(obs[0][10:13])
+        history['action'].append(action[0])
+        
+        
         p.resetBasePositionAndOrientation(env.DRONE_IDS[1], true_state[0:3], [0,0,0,1], physicsClientId=PYB)
         
         p_chaser = obs[0][0:3]
@@ -349,6 +437,8 @@ def run():
         # --- DOCKING COMPLETION ---
         dist_real = np.linalg.norm(p_chaser - p_target)
         if docking_phase == 1 and dist_real < 0.15:
+            plot_performance(history)
+            
             frozen = True
             freeze_pos_c = p_chaser
             freeze_pos_t = p_target
@@ -442,6 +532,9 @@ def run():
 
         env.render()
         sync(i, START, env.CTRL_TIMESTEP)
+        
+    plot_performance(history) # Add here too for timeout cases
+    
     
     env.close()
 
