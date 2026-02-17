@@ -233,32 +233,150 @@ class AsyncPlanner(threading.Thread):
         self.prev_sol = x_ref
         return x_ref
 
-def plot_performance(history):
+# def plot_performance(history):
+#     t = np.array(history['t'])
+#     p_c = np.array(history['p_c'])
+#     p_t = np.array(history['p_t'])
+#     v_c = np.array(history['v_c'])
+#     act = np.array(history['action']) # Raw RPMs
+    
+#     # 1. Error Vector
+#     err_vec = p_c - p_t
+    
+#     # 2. Net Thrust (Sum of RPMs)
+#     net_thrust = np.sum(act, axis=1)
+
+#     # --- PLOT 1: 3D TRAJECTORY ---
+#     fig1 = plt.figure(figsize=(10, 8))
+#     ax1 = fig1.add_subplot(111, projection='3d')
+#     ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
+#     ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
+#     ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
+#     ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
+#     # ax1.set_title("3D Trajectory")
+#     ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+#     ax1.legend()
+#     fig1.canvas.manager.set_window_title("Figure 1: 3D Trajectory")
+
+#     # --- PLOT 2: POSITION EVOLUTION ---
+#     fig2 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, p_t[:,0], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,0], 'b-', label='X')
+#     plt.plot(t, p_t[:,1], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,1], 'r-', label='Y')
+#     plt.plot(t, p_t[:,2], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,2], 'k-', label='Z')
+#     # plt.title("Position Evolution (Target=Dashed)")
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Position (m)")
+#     plt.grid(True)
+#     plt.legend()
+#     fig2.canvas.manager.set_window_title("Figure 2: Position")
+
+#     # --- PLOT 3: TRACKING ERROR ---
+#     fig3 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, err_vec[:,0], 'b-', label='X Err')
+#     plt.plot(t, err_vec[:,1], 'r-', label='Y Err')
+#     plt.plot(t, err_vec[:,2], 'k-', label='Z Err')
+#     plt.axhline(0, color='k', linestyle=':', alpha=0.5)
+#     # plt.title("Tracking Error (Chaser - Target)")
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Error (m)")
+#     plt.grid(True)
+#     plt.legend()
+#     fig3.canvas.manager.set_window_title("Figure 3: Tracking Error")
+
+#     # --- PLOT 4: VELOCITY ---
+#     fig4 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, v_c[:,0], label='Vx')
+#     plt.plot(t, v_c[:,1], label='Vy')
+#     plt.plot(t, v_c[:,2], label='Vz')
+#     # plt.title("Chaser Velocities")
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Velocity (m/s)")
+#     plt.grid(True)
+#     plt.legend()
+#     fig4.canvas.manager.set_window_title("Figure 4: Velocity")
+
+#     # --- PLOT 5: NET CONTROL INPUT (THRUST) ---
+#     fig5 = plt.figure(figsize=(3.4, 2.4))  # Single-column size
+
+#     start_idx = min(len(t)-1, 50)
+#     hover_rpm = np.mean(act[start_idx:], axis=0)
+#     act_dev = act - hover_rpm
+
+#     control_norm = np.linalg.norm(act_dev, axis=1)
+
+#     plt.plot(t, control_norm, 'k-', linewidth=1.8)
+
+#     plt.xlabel("Time (s)")
+#     plt.ylabel(r"$||\Delta u||$ (RPM)")
+#     plt.grid(True, linestyle='--', alpha=0.5)
+#     plt.legend(ncol=2)
+
+#     fig5.canvas.manager.set_window_title("Figure 5: Control Effort")
+    
+    
+#     plt.show()
+    
+    
+    
+def plot_performance(history, docking_threshold=0.1):
+
     t = np.array(history['t'])
     p_c = np.array(history['p_c'])
     p_t = np.array(history['p_t'])
     v_c = np.array(history['v_c'])
-    act = np.array(history['action']) # Raw RPMs
-    
-    # 1. Error Vector
-    err_vec = p_c - p_t
-    
-    # 2. Net Thrust (Sum of RPMs)
-    net_thrust = np.sum(act, axis=1)
+    act = np.array(history['action'])
 
-    # --- PLOT 1: 3D TRAJECTORY ---
+    # -------------------------------------------------
+    # Distance & Error
+    # -------------------------------------------------
+    err_vec = p_c - p_t
+    dist = np.linalg.norm(err_vec, axis=1)
+
+    # -------------------------------------------------
+    # Control Effort
+    # -------------------------------------------------
+    start_idx = min(len(t)-1, 50)
+    hover_rpm = np.mean(act[start_idx:], axis=0)
+    act_dev = act - hover_rpm
+    control_norm = np.linalg.norm(act_dev, axis=1)
+
+    # -------------------------------------------------
+    # Compute Quantitative Metrics
+    # -------------------------------------------------
+    d0 = dist[0]
+    df = dist[-1]
+    emax = np.max(dist)
+    u_max = np.max(control_norm)
+
+    idx = np.where(dist < docking_threshold)[0]
+    td = t[idx[0]] if len(idx) > 0 else None
+
+    print("\n--- PERFORMANCE METRICS ---")
+    print(f"Initial Distance d0        : {d0:.4f} m")
+    print(f"Final Distance df          : {df:.4f} m")
+    print(f"Maximum Tracking Error     : {emax:.4f} m")
+    print(f"Max Control Effort ||Δu||  : {u_max:.2f} RPM")
+    print(f"Docking Time td            : {td:.4f} s" if td else "Docking Time td: Not reached")
+    print("--------------------------------\n")
+
+    # -------------------------------------------------
+    # --- PLOTS (UNCHANGED EXCEPT CONTROL PLOT) ---
+    # -------------------------------------------------
+
+    # 1. 3D TRAJECTORY
     fig1 = plt.figure(figsize=(10, 8))
     ax1 = fig1.add_subplot(111, projection='3d')
     ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
     ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
     ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
     ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
-    # ax1.set_title("3D Trajectory")
     ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
     ax1.legend()
-    fig1.canvas.manager.set_window_title("Figure 1: 3D Trajectory")
 
-    # --- PLOT 2: POSITION EVOLUTION ---
+    # 2. POSITION EVOLUTION
     fig2 = plt.figure(figsize=(10, 6))
     plt.plot(t, p_t[:,0], 'g--', alpha=0.4)
     plt.plot(t, p_c[:,0], 'b-', label='X')
@@ -266,59 +384,138 @@ def plot_performance(history):
     plt.plot(t, p_c[:,1], 'r-', label='Y')
     plt.plot(t, p_t[:,2], 'g--', alpha=0.4)
     plt.plot(t, p_c[:,2], 'k-', label='Z')
-    # plt.title("Position Evolution (Target=Dashed)")
     plt.xlabel("Time (s)")
     plt.ylabel("Position (m)")
     plt.grid(True)
     plt.legend()
-    fig2.canvas.manager.set_window_title("Figure 2: Position")
 
-    # --- PLOT 3: TRACKING ERROR ---
-    fig3 = plt.figure(figsize=(10, 6))
-    plt.plot(t, err_vec[:,0], 'b-', label='X Err')
-    plt.plot(t, err_vec[:,1], 'r-', label='Y Err')
-    plt.plot(t, err_vec[:,2], 'k-', label='Z Err')
-    plt.axhline(0, color='k', linestyle=':', alpha=0.5)
-    # plt.title("Tracking Error (Chaser - Target)")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Error (m)")
-    plt.grid(True)
-    plt.legend()
-    fig3.canvas.manager.set_window_title("Figure 3: Tracking Error")
+    # 3. TRACKING ERROR
+    # 3. TRACKING ERROR (Scaled for Paper)
+    fig3 = plt.figure(figsize=(4.5, 3.4), dpi=300)
 
-    # --- PLOT 4: VELOCITY ---
+    plt.plot(t, err_vec[:,0], color='#1f77b4', linewidth=2.0, label='Err X')
+    plt.plot(t, err_vec[:,1], color='#d62728', linewidth=2.0, label='Err Y')
+    plt.plot(t, err_vec[:,2], color='black', linewidth=2.0, label='Err Z')
+
+    plt.axhline(0, color='gray', linestyle=':', linewidth=1)
+
+    plt.xlabel("Time (s)", fontsize=13)
+    plt.ylabel("Tracking Error (m)", fontsize=13)
+
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
+
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.legend(fontsize=10, frameon=True)
+
+    plt.tight_layout(pad=1.2)
+    plt.subplots_adjust(bottom=0.18)  # <-- Important line
+
+
+
+    # 4. VELOCITY
     fig4 = plt.figure(figsize=(10, 6))
     plt.plot(t, v_c[:,0], label='Vx')
     plt.plot(t, v_c[:,1], label='Vy')
     plt.plot(t, v_c[:,2], label='Vz')
-    # plt.title("Chaser Velocities")
     plt.xlabel("Time (s)")
     plt.ylabel("Velocity (m/s)")
     plt.grid(True)
     plt.legend()
-    fig4.canvas.manager.set_window_title("Figure 4: Velocity")
 
-    # --- PLOT 5: NET CONTROL INPUT (THRUST) ---
-    fig5 = plt.figure(figsize=(10, 6))
-    plt.plot(t, net_thrust, 'purple', linewidth=2, label='Net Thrust (Sum RPM)')
-    
-    # Auto-Zoom
-    start_idx = min(len(t)-1, 50)
-    if len(t) > start_idx:
-        y_min = np.min(net_thrust[start_idx:])
-        y_max = np.max(net_thrust[start_idx:])
-        margin = max(500, (y_max - y_min) * 0.2)
-        plt.ylim(y_min - margin, y_max + margin)
-    
-    # plt.title("Net Control Input (Total Thrust)")
-    plt.ylabel("Collective RPM")
-    plt.xlabel("Time (s)")
-    plt.grid(True, which='both', linestyle='--', alpha=0.7)
-    plt.legend()
-    fig5.canvas.manager.set_window_title("Figure 5: Control Input")
+    # 5. CONTROL EFFORT (Norm Only – Clean)
+    fig5 = plt.figure(figsize=(4.2, 3.0), dpi=300)
 
+    # Large smoothing window for clean trend
+    window = 35
+    control_smooth = np.convolve(
+        control_norm,
+        np.ones(window)/window,
+        mode='same'
+    )
+
+    # Raw (noisy, thin)
+    plt.plot(t, control_norm,
+            color='#1f77b4',
+            linewidth=1.0,
+            label='Raw')
+
+    # Clean moving average (smooth curve)
+    plt.plot(t, control_smooth,
+            color='black',
+            linestyle='--',
+            linewidth=2.5,
+            label='Moving Avg')
+
+    plt.xlabel("Time (s)", fontsize=12)
+    plt.ylabel(r"$||\Delta u||$ (RPM)", fontsize=12)
+    plt.xticks(fontsize=11)
+    plt.yticks(fontsize=11)
+
+    plt.grid(True, linestyle=':', alpha=0.4)
+
+    plt.legend(fontsize=9, frameon=False, loc='best')
+
+    plt.tight_layout()
+    
+    
+    # --- FIG 6: Docking Cone Constraint ---
+    # --- FIG 6: Docking Angle (Terminal Zoom) ---
+    fig6 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+
+    # Relative vector (target - chaser)
+    rel_vec = p_c - p_t
+    rel_norm = np.linalg.norm(rel_vec, axis=1)
+
+    # Docking axis (example: target z-axis — change if needed)
+    a_hat = np.array([0, 0, 1])
+
+    # Compute angle
+    cos_theta = np.dot(rel_vec, a_hat) / (rel_norm + 1e-6)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+
+    theta_cone = np.deg2rad(30)
+
+    # --- Zoom last 3 seconds ---
+    t_end = t[-1]
+    mask = t >= (t_end - 3.0)
+
+    plt.plot(t[mask], np.rad2deg(theta[mask]),
+            color='#1f77b4',
+            linewidth=2.2,
+            label=r'$\theta(t)$')
+
+    plt.axhline(np.rad2deg(theta_cone),
+                color='black',
+                linestyle='--',
+                linewidth=1.8,
+                label=r'$\theta_{cone}$')
+
+    plt.xlabel("Time (s)", fontsize=12)
+    plt.ylabel("Cone Angle (deg)", fontsize=12)
+
+    plt.xticks(fontsize=11)
+    plt.yticks(fontsize=11)
+
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.legend(fontsize=9, frameon=False)
+
+    plt.tight_layout()
     plt.show()
+
     
+   
+            
+    
+
+
+
+
+
+
+    return d0, df, emax, u_max, td
+
     
     
 # ======================================================================
