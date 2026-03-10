@@ -953,6 +953,9 @@ def run():
     # Draw trajectory preview
     for t in np.arange(0, DURATION_SEC, 0.1):
         p.addUserDebugLine(target_gen.get_state(t)[0:3], target_gen.get_state(t+0.1)[0:3], [0.5, 0, 0.5], 2, physicsClientId=PYB)
+    
+    paused = False   # <-- ADD THIS
+    
             
     try:
             for i in range(int(DURATION_SEC * CTRL_FREQ)):
@@ -962,6 +965,18 @@ def run():
                 if not p.isConnected(physicsClientId=PYB):
                     print("\n[USER] Window closed. Finishing...")
                     break
+                
+                
+                keys = p.getKeyboardEvents()
+                if ord(' ') in keys and keys[ord(' ')] & p.KEY_WAS_TRIGGERED:
+                    paused = not paused
+                    print("[SIM] Paused" if paused else "[SIM] Resumed")
+
+                if paused:
+                    env.render()
+                    sync(i, START, env.CTRL_TIMESTEP)
+                    continue
+                    
                     
                 # 1. FREEZE LOGIC
                 if frozen:
