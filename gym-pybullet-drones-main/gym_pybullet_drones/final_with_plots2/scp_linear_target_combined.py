@@ -966,17 +966,19 @@ def run():
                     print("\n[USER] Window closed. Finishing...")
                     break
                 
-                
                 keys = p.getKeyboardEvents()
                 if ord(' ') in keys and keys[ord(' ')] & p.KEY_WAS_TRIGGERED:
-                    paused = not paused
-                    print("[SIM] Paused" if paused else "[SIM] Resumed")
+                    print("[SIM] Paused. Press SPACE to resume.")
 
-                if paused:
-                    env.render()
-                    sync(i, START, env.CTRL_TIMESTEP)
-                    continue
-                    
+                    while True:
+                        keys = p.getKeyboardEvents()
+
+                        if ord(' ') in keys and keys[ord(' ')] & p.KEY_WAS_TRIGGERED:
+                            print("[SIM] Resumed.")
+                            break
+
+                        env.render()
+                        time.sleep(0.01)
                     
                 # 1. FREEZE LOGIC
                 if frozen:
