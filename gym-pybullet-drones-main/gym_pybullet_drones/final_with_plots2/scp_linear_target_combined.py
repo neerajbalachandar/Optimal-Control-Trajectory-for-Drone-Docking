@@ -1016,12 +1016,12 @@ def run():
                 if docking_phase == 0:
                     # Use 2D distance so it dives the moment it catches up horizontally
                     xy_dist = np.linalg.norm(p_chaser[0:2] - p_target[0:2])
-                    if xy_dist < 0.35:
+                    if xy_dist < 0.4:
                         docking_phase = 1
                         print(f"[PHASE] {sim_t:.2f}s | Switched to Terminal Phase (Diving in!)")
 
                 # --- DOCKING COMPLETION CHECK (Wind-Relaxed) ---
-                if docking_phase == 1 and np.linalg.norm(p_chaser - p_target) < 0.15:
+                if docking_phase == 1 and np.linalg.norm(p_chaser - p_target) < 0.2:
                     frozen = True
                     freeze_pos_c = p_chaser
                     freeze_pos_t = p_target
