@@ -1016,7 +1016,7 @@ def run():
                 if docking_phase == 0:
                     # Use 2D distance so it dives the moment it catches up horizontally
                     xy_dist = np.linalg.norm(p_chaser[0:2] - p_target[0:2])
-                    if xy_dist < 0.4:
+                    if xy_dist < 0.35:
                         docking_phase = 1
                         print(f"[PHASE] {sim_t:.2f}s | Switched to Terminal Phase (Diving in!)")
 
