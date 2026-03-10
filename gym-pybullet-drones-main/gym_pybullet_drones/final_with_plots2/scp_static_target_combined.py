@@ -1,0 +1,1317 @@
+import time
+import numpy as np
+import cvxpy as cp
+import pybullet as p
+import matplotlib.pyplot as plt
+
+from gym_pybullet_drones.utils.enums import DroneModel, Physics
+from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
+from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
+from gym_pybullet_drones.utils.utils import sync
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+# ======================================================================
+# 0. CONFIGURATION & CONSTANTS
+# ======================================================================
+DOCKING_AXIS = np.array([0.0, 0.0,-1.0]) 
+CONE_ANGLE   = 30    # Degrees
+DURATION_SEC = 20    # Time for trajectory
+SAFETY_R     = 0.1   # Safety Radius (Hull size)
+ALPHA_LIMIT  = 1.05  # Collision Trigger Threshold (Distance/Radius ratio)
+
+# Wind Configuration
+WIND_NOMINAL  = np.array([0.5, -0.3, -0.1]) # Constant drift
+WIND_GUST_AMP = 0.1                         # Random noise magnitude
+
+# FSM States
+STATE_TRACKING    = 0
+STATE_BACKING_OFF = 1
+STATE_REPLANNING  = 2
+
+# ======================================================================
+# 1. ROBUST DCOL SOLVER (Safety Check)
+# ======================================================================
+def solve_dcol_scaling(p1, r1, p2, r2):
+    """
+    Calculates the collision scaling factor alpha.
+    alpha < 1.0 implies collision.
+    """
+    # 1. Fast Analytical Check
+    dist = np.linalg.norm(p1 - p2)
+    alpha_analytic = dist / (r1 + r2)
+    
+    # 2. Optimization Check (Formal method fallback)
+    # We use analytical primarily for speed in Python, 
+    # but this structure allows swapping in the CVX solver if shapes become complex.
+    contact_pt = p1 + (p2 - p1) * (r1 / (r1 + r2))
+    return alpha_analytic, contact_pt
+
+# ======================================================================
+# 2. SCP TRAJECTORY PLANNER
+# ======================================================================
+def plan_scp_docking(p_start, v_start, p_goal, p_obs, r_obs, docking_axis, cone_angle_deg, N, dt):
+    """
+    Generates a trajectory satisfying Dynamics, Obstacles, and Docking Cone.
+    Includes 'Smart Entry' initialization to help the solver find the cone entrance.
+    """
+    print(f"[SCP] Planning N={N} from {p_start} with Vel {v_start}...")
+    
+    # Dynamics (Double Integrator 3D)
+    A = np.eye(6); A[0,3]=dt; A[1,4]=dt; A[2,5]=dt
+    B = np.zeros((6,3)); B[0,0]=0.5*dt**2; B[1,1]=0.5*dt**2; B[2,2]=0.5*dt**2; B[3,0]=dt; B[4,1]=dt; B[5,2]=dt
+
+    # Cone Math
+    n_approach = docking_axis / np.linalg.norm(docking_axis)
+    cos_theta = np.cos(np.deg2rad(cone_angle_deg))
+
+    # --- SMART INITIALIZATION (Hybrid) ---
+    # Define an "Entry Point" 2.5m out along the docking axis
+    p_entry = p_goal - n_approach * 2.5
+    
+    x_ref = np.zeros((6, N))
+    split_idx = int(0.6 * N) # 60% of time to reach entry point
+    
+    for k in range(N):
+        if k < split_idx:
+            # Phase 1: Go to Entry Point (Bezier-ish curve to clear obstacles)
+            alpha = k / split_idx
+            # Pos
+            x_ref[0:3, k] = (1 - alpha) * p_start + alpha * p_entry
+            # Add a small Z-hop to clear low obstacles if starting far away
+            if np.linalg.norm(p_start - p_entry) > 1.0:
+                x_ref[2, k] += 0.5 * np.sin(np.pi * alpha)
+            # Vel
+            x_ref[3:6, k] = v_start * (1 - alpha) # Decay initial velocity
+        else:
+            # Phase 2: Straight Approach (Entry -> Goal)
+            alpha = (k - split_idx) / (N - split_idx)
+            x_ref[0:3, k] = (1 - alpha) * p_entry + alpha * p_goal
+
+    # --- SCP LOOP ---
+    max_iters = 15
+    solved_traj = None
+
+    for iteration in range(max_iters):
+        x = cp.Variable((6,N))
+        u = cp.Variable((3,N-1))
+        slack_obs = cp.Variable(N, nonneg=True)
+        slack_cone = cp.Variable(N, nonneg=True)
+
+        # Cost: Minimal Control + Heavy penalties on Slacks
+        cost = 0.1*cp.sum_squares(u) + 10000*cp.sum(slack_obs) + 10000*cp.sum(slack_cone)
+        constraints = []
+
+        # 1. Initial State
+        constraints += [x[:,0] == np.hstack([p_start, v_start])]
+        
+        # 2. Dynamics
+        for k in range(N-1):
+            constraints += [x[:,k+1] == A@x[:,k] + B@u[:,k]]
+            constraints += [cp.norm(u[:,k], 2) <= 12.0] # Actuation Limit
+
+        # 3. Terminal Constraints
+        constraints += [cp.norm(x[0:3,-1] - p_goal) <= 0.05] # Position Accuracy
+        constraints += [cp.norm(x[3:6,-1]) <= 0.1]           # Velocity near zero
+
+        # 4. State Constraints (Linearized)
+        for k in range(1, N):
+            # A. Obstacle Avoidance
+            p_ref = x_ref[0:3,k]
+            vec = p_ref - p_obs
+            dist = np.linalg.norm(vec)
+            n_obs_vec = vec/dist if dist > 1e-3 else np.array([0,1,0])
+            constraints += [n_obs_vec @ (x[0:3,k] - p_obs) >= r_obs - slack_obs[k]]
+
+            # B. Docking Cone (Active only in approach phase)
+            # Logic: Project p_rel onto -n_approach (distance 'deep' into cone)
+            # Radius at that depth = dist_long * tan(theta).
+            # Constraint: ||p_lateral|| <= radius
+            # Simplified SOCP form: ||p_rel|| * cos(theta) <= dist_long
+            if k > split_idx:
+                p_rel = x[0:3,k] - p_goal 
+                dist_long = -n_approach @ p_rel
+                
+                constraints += [dist_long >= 0]
+                constraints += [cp.norm(p_rel) * cos_theta <= dist_long + slack_cone[k]]
+
+        # 5. Trust Region
+        for k in range(N):
+            constraints += [cp.norm(x[:,k] - x_ref[:,k]) <= 1.0]
+
+        # Solve
+        prob = cp.Problem(cp.Minimize(cost), constraints)
+            
+        try:
+            prob.solve(solver=cp.CLARABEL)
+        except:
+            try: prob.solve(solver=cp.ECOS)
+            except: prob.solve(solver=cp.SCS)
+
+        if x.value is None:
+            print(f"  > Iter {iteration}: Solver Failed.")
+            break
+            
+        diff = np.linalg.norm(x.value - x_ref)
+        x_ref = x.value.copy()
+        
+        if diff < 0.1:
+            print(f"  > Iter {iteration}: Converged.")
+            solved_traj = x_ref[0:3,:].T
+            break
+
+    return solved_traj
+    
+# def plot_performance(history):
+#     t = np.array(history['t'])
+#     p_c = np.array(history['p_c'])
+#     p_t = np.array(history['p_t'])
+#     v_c = np.array(history['v_c'])
+#     act = np.array(history['action']) # Raw RPMs
+    
+#     # 1. Error Vector
+#     err_vec = p_c - p_t
+    
+#     # 2. Net Thrust (Sum of RPMs)
+#     net_thrust = np.sum(act, axis=1)
+
+#     # --- PLOT 1: 3D TRAJECTORY ---
+#     fig1 = plt.figure(figsize=(10, 8))
+#     ax1 = fig1.add_subplot(111, projection='3d')
+#     ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
+#     ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
+#     ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
+#     ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
+#     # ax1.set_title("3D Trajectory")
+#     ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+#     ax1.legend()
+#     fig1.canvas.manager.set_window_title("Figure 1: 3D Trajectory")
+
+#     # --- PLOT 2: POSITION EVOLUTION ---
+#     fig2 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, p_t[:,0], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,0], 'b-', label='X')
+#     plt.plot(t, p_t[:,1], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,1], 'r-', label='Y')
+#     plt.plot(t, p_t[:,2], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,2], 'k-', label='Z')
+#     # plt.title("Position Evolution (Target=Dashed)")
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Position (m)")
+#     plt.grid(True)
+#     plt.legend()
+#     fig2.canvas.manager.set_window_title("Figure 2: Position")
+
+#     # --- PLOT 3: TRACKING ERROR ---
+#     fig3 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, err_vec[:,0], 'b-', label='X Err')
+#     plt.plot(t, err_vec[:,1], 'r-', label='Y Err')
+#     plt.plot(t, err_vec[:,2], 'k-', label='Z Err')
+#     plt.axhline(0, color='k', linestyle=':', alpha=0.5)
+#     # plt.title("Tracking Error (Chaser - Target)")
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Error (m)")
+#     plt.grid(True)
+#     plt.legend()
+#     fig3.canvas.manager.set_window_title("Figure 3: Tracking Error")
+
+#     # --- PLOT 4: VELOCITY ---
+#     fig4 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, v_c[:,0], label='Vx')
+#     plt.plot(t, v_c[:,1], label='Vy')
+#     plt.plot(t, v_c[:,2], label='Vz')
+#     # plt.title("Chaser Velocities")
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Velocity (m/s)")
+#     plt.grid(True)
+#     plt.legend()
+#     fig4.canvas.manager.set_window_title("Figure 4: Velocity")
+
+#     # --- PLOT 5: NET CONTROL INPUT (THRUST) ---
+#     fig5 = plt.figure(figsize=(3.4, 2.4))  # Single-column size
+
+#     start_idx = min(len(t)-1, 50)
+#     hover_rpm = np.mean(act[start_idx:], axis=0)
+#     act_dev = act - hover_rpm
+
+#     control_norm = np.linalg.norm(act_dev, axis=1)
+
+#     plt.plot(t, control_norm, 'k-', linewidth=1.8)
+
+#     plt.xlabel("Time (s)")
+#     plt.ylabel(r"$||\Delta u||$ (RPM)")
+#     plt.grid(True, linestyle='--', alpha=0.5)
+#     plt.legend(ncol=2)
+
+#     fig5.canvas.manager.set_window_title("Figure 5: Control Effort")
+    
+    
+#     plt.show()
+
+
+
+# def plot_performance(history, docking_threshold=0.1):
+
+#     t = np.array(history['t'])
+#     p_c = np.array(history['p_c'])
+#     p_t = np.array(history['p_t'])
+#     v_c = np.array(history['v_c'])
+#     act = np.array(history['action'])
+
+#     # -------------------------------------------------
+#     # Distance & Error
+#     # -------------------------------------------------
+#     err_vec = p_c - p_t
+#     dist = np.linalg.norm(err_vec, axis=1)
+
+#     # -------------------------------------------------
+#     # Control Effort
+#     # -------------------------------------------------
+#     start_idx = min(len(t)-1, 50)
+#     hover_rpm = np.mean(act[start_idx:], axis=0)
+#     act_dev = act - hover_rpm
+#     control_norm = np.linalg.norm(act_dev, axis=1)
+
+#     # -------------------------------------------------
+#     # Compute Quantitative Metrics
+#     # -------------------------------------------------
+#     d0 = dist[0]
+#     df = dist[-1]
+#     emax = np.max(dist)
+#     u_max = np.max(control_norm)
+
+#     idx = np.where(dist < docking_threshold)[0]
+#     td = t[idx[0]] if len(idx) > 0 else None
+
+#     print("\n--- PERFORMANCE METRICS ---")
+#     print(f"Initial Distance d0        : {d0:.4f} m")
+#     print(f"Final Distance df          : {df:.4f} m")
+#     print(f"Maximum Tracking Error     : {emax:.4f} m")
+#     print(f"Max Control Effort ||Δu||  : {u_max:.2f} RPM")
+#     print(f"Docking Time td            : {td:.4f} s" if td else "Docking Time td: Not reached")
+#     print("--------------------------------\n")
+
+#     # -------------------------------------------------
+#     # --- PLOTS (UNCHANGED EXCEPT CONTROL PLOT) ---
+#     # -------------------------------------------------
+
+#     # 1. 3D TRAJECTORY
+#     fig1 = plt.figure(figsize=(10, 8))
+#     ax1 = fig1.add_subplot(111, projection='3d')
+#     ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
+#     ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
+#     ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
+#     ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
+#     ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+#     ax1.legend()
+
+#     # 2. POSITION EVOLUTION
+#     fig2 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, p_t[:,0], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,0], 'b-', label='X')
+#     plt.plot(t, p_t[:,1], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,1], 'r-', label='Y')
+#     plt.plot(t, p_t[:,2], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,2], 'k-', label='Z')
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Position (m)")
+#     plt.grid(True)
+#     plt.legend()
+
+#     # 3. TRACKING ERROR
+#     # 3. TRACKING ERROR (Scaled for Paper)
+#     fig3 = plt.figure(figsize=(4.5, 3.4), dpi=300)
+
+#     plt.plot(t, err_vec[:,0], color='#1f77b4', linewidth=2.0, label='Err X')
+#     plt.plot(t, err_vec[:,1], color='#d62728', linewidth=2.0, label='Err Y')
+#     plt.plot(t, err_vec[:,2], color='black', linewidth=2.0, label='Err Z')
+
+#     plt.axhline(0, color='gray', linestyle=':', linewidth=1)
+
+#     plt.xlabel("Time (s)", fontsize=13)
+#     plt.ylabel("Tracking Error (m)", fontsize=13)
+
+#     plt.xticks(fontsize=12)
+#     plt.yticks(fontsize=12)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=10, frameon=True)
+
+#     plt.tight_layout(pad=1.2)
+#     plt.subplots_adjust(bottom=0.18)  # <-- Important line
+
+
+
+#     # 4. VELOCITY
+#     fig4 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, v_c[:,0], label='Vx')
+#     plt.plot(t, v_c[:,1], label='Vy')
+#     plt.plot(t, v_c[:,2], label='Vz')
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Velocity (m/s)")
+#     plt.grid(True)
+#     plt.legend()
+
+#     # 5. CONTROL EFFORT (Norm Only – Clean)
+#     fig5 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+
+#     # Large smoothing window for clean trend
+#     window = 35
+#     control_smooth = np.convolve(
+#         control_norm,
+#         np.ones(window)/window,
+#         mode='same'
+#     )
+
+#     # Raw (noisy, thin)
+#     plt.plot(t, control_norm,
+#             color='#1f77b4',
+#             linewidth=1.0,
+#             label='Raw')
+
+#     # Clean moving average (smooth curve)
+#     plt.plot(t, control_smooth,
+#             color='black',
+#             linestyle='--',
+#             linewidth=2.5,
+#             label='Moving Avg')
+
+#     plt.xlabel("Time (s)", fontsize=12)
+#     plt.ylabel(r"$||\Delta u||$ (RPM)", fontsize=12)
+#     plt.xticks(fontsize=11)
+#     plt.yticks(fontsize=11)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+
+#     plt.legend(fontsize=9, frameon=False, loc='best')
+
+#     plt.tight_layout()
+    
+    
+#     # --- FIG 6: Docking Cone Constraint ---
+#     # --- FIG 6: Docking Angle (Terminal Zoom) ---
+#     fig6 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+
+#     # Relative vector (target - chaser)
+#     rel_vec = p_c - p_t
+#     rel_norm = np.linalg.norm(rel_vec, axis=1)
+
+#     # Docking axis (example: target z-axis — change if needed)
+#     a_hat = np.array([0, 0, 1])
+
+#     # Compute angle
+#     cos_theta = np.dot(rel_vec, a_hat) / (rel_norm + 1e-6)
+#     cos_theta = np.clip(cos_theta, -1.0, 1.0)
+#     theta = np.arccos(cos_theta)
+
+#     theta_cone = np.deg2rad(30)
+
+#     # --- Zoom last 3 seconds ---
+#     t_end = t[-1]
+#     mask = t >= (t_end - 3.0)
+
+#     plt.plot(t[mask], np.rad2deg(theta[mask]),
+#             color='#1f77b4',
+#             linewidth=2.2,
+#             label=r'$\theta(t)$')
+
+#     plt.axhline(np.rad2deg(theta_cone),
+#                 color='black',
+#                 linestyle='--',
+#                 linewidth=1.8,
+#                 label=r'$\theta_{cone}$')
+
+#     plt.xlabel("Time (s)", fontsize=12)
+#     plt.ylabel("Cone Angle (deg)", fontsize=12)
+
+#     plt.xticks(fontsize=11)
+#     plt.yticks(fontsize=11)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=9, frameon=False)
+
+#     plt.tight_layout()
+#     plt.show()
+
+    
+   
+            
+    
+
+
+
+
+
+
+#     return d0, df, emax, u_max, td
+
+
+
+# def plot_performance(history, docking_threshold=0.1):
+
+#     t = np.array(history['t'])
+#     p_c = np.array(history['p_c'])
+#     p_t = np.array(history['p_t'])
+#     v_c = np.array(history['v_c'])
+#     act = np.array(history['action'])
+
+#     # -------------------------------------------------
+#     # Distance & Error
+#     # -------------------------------------------------
+#     err_vec = p_c - p_t
+#     dist = np.linalg.norm(err_vec, axis=1)
+
+#     # -------------------------------------------------
+#     # Control Effort (Non-Dimensionalized)
+#     # -------------------------------------------------
+#     start_idx = min(len(t)-1, 50)
+#     hover_rpm = np.mean(act[start_idx:], axis=0)
+    
+#     # Raw deviation
+#     act_dev = act - hover_rpm
+#     control_norm = np.linalg.norm(act_dev, axis=1)
+    
+#     # Normalize by the magnitude of the hover state to make it dimensionless
+#     hover_norm = np.linalg.norm(hover_rpm) + 1e-6 # Add epsilon to avoid div by zero
+#     normalized_control = control_norm / hover_norm
+
+#     # -------------------------------------------------
+#     # Compute Quantitative Metrics
+#     # -------------------------------------------------
+#     d0 = dist[0]
+#     df = dist[-1]
+#     emax = np.max(dist)
+#     u_max_nd = np.max(normalized_control) # Now dimensionless
+
+#     idx = np.where(dist < docking_threshold)[0]
+#     td = t[idx[0]] if len(idx) > 0 else None
+
+#     print("\n--- PERFORMANCE METRICS ---")
+#     print(f"Initial Distance d0        : {d0:.4f} m")
+#     print(f"Final Distance df          : {df:.4f} m")
+#     print(f"Maximum Tracking Error     : {emax:.4f} m")
+#     print(f"Max Control Effort (Norm)  : {u_max_nd:.4f}") # Updated label and format
+#     print(f"Docking Time td            : {td:.4f} s" if td else "Docking Time td: Not reached")
+#     print("--------------------------------\n")
+
+#     # -------------------------------------------------
+#     # --- PLOTS ---
+#     # -------------------------------------------------
+
+#     # 1. 3D TRAJECTORY
+#     fig1 = plt.figure(figsize=(10, 8))
+#     ax1 = fig1.add_subplot(111, projection='3d')
+#     ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
+#     ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
+#     ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
+#     ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
+#     ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+#     ax1.legend()
+
+#     # 2. POSITION EVOLUTION
+#     fig2 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, p_t[:,0], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,0], 'b-', label='X')
+#     plt.plot(t, p_t[:,1], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,1], 'r-', label='Y')
+#     plt.plot(t, p_t[:,2], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,2], 'k-', label='Z')
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Position (m)")
+#     plt.grid(True)
+#     plt.legend()
+
+#     # 3. TRACKING ERROR (Scaled for Paper)
+#     fig3 = plt.figure(figsize=(4.5, 3.4), dpi=300)
+
+#     plt.plot(t, err_vec[:,0], color='#1f77b4', linewidth=2.0, label='Err X')
+#     plt.plot(t, err_vec[:,1], color='#d62728', linewidth=2.0, label='Err Y')
+#     plt.plot(t, err_vec[:,2], color='black', linewidth=2.0, label='Err Z')
+
+#     plt.axhline(0, color='gray', linestyle=':', linewidth=1)
+
+#     plt.xlabel("Time (s)", fontsize=13)
+#     plt.ylabel("Tracking Error (m)", fontsize=13)
+
+#     plt.xticks(fontsize=12)
+#     plt.yticks(fontsize=12)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=10, frameon=True)
+
+#     plt.tight_layout(pad=1.2)
+#     plt.subplots_adjust(bottom=0.18) 
+
+#     # 4. VELOCITY
+#     fig4 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, v_c[:,0], label='Vx')
+#     plt.plot(t, v_c[:,1], label='Vy')
+#     plt.plot(t, v_c[:,2], label='Vz')
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Velocity (m/s)")
+#     plt.grid(True)
+#     plt.legend()
+
+#     # 5. CONTROL EFFORT (Normalized - Non-dimensional)
+#     fig5 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+
+#     # Large smoothing window for clean trend
+#     window = 35
+#     control_smooth = np.convolve(
+#         normalized_control,
+#         np.ones(window)/window,
+#         mode='same'
+#     )
+
+#     # Raw (noisy, thin)
+#     plt.plot(t, normalized_control,
+#             color='#1f77b4',
+#             linewidth=1.0,
+#             label='Raw')
+
+#     # Clean moving average (smooth curve)
+#     plt.plot(t, control_smooth,
+#             color='black',
+#             linestyle='--',
+#             linewidth=2.5,
+#             label='Moving Avg')
+
+#     plt.xlabel("Time (s)", fontsize=12)
+#     # Updated Y-label to reflect dimensionless ratio
+#     plt.ylabel(r"Normalized $||\Delta u||$", fontsize=12) 
+#     plt.xticks(fontsize=11)
+#     plt.yticks(fontsize=11)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=9, frameon=False, loc='best')
+
+#     plt.tight_layout()
+    
+#     # 6. DOCKING CONE CONSTRAINT (Terminal Zoom)
+#     fig6 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+
+#     # Relative vector (target - chaser)
+#     rel_vec = p_c - p_t
+#     rel_norm = np.linalg.norm(rel_vec, axis=1)
+
+#     # Docking axis (example: target z-axis — change if needed)
+#     a_hat = np.array([0, 0, 1])
+
+#     # Compute angle
+#     cos_theta = np.dot(rel_vec, a_hat) / (rel_norm + 1e-6)
+#     cos_theta = np.clip(cos_theta, -1.0, 1.0)
+#     theta = np.arccos(cos_theta)
+
+#     theta_cone = np.deg2rad(30)
+
+#     # --- Zoom last 3 seconds ---
+#     t_end = t[-1]
+#     mask = t >= (t_end - 3.0)
+
+#     plt.plot(t[mask], np.rad2deg(theta[mask]),
+#             color='#1f77b4',
+#             linewidth=2.2,
+#             label=r'$\theta(t)$')
+
+#     plt.axhline(np.rad2deg(theta_cone),
+#                 color='black',
+#                 linestyle='--',
+#                 linewidth=1.8,
+#                 label=r'$\theta_{cone}$')
+
+#     plt.xlabel("Time (s)", fontsize=12)
+#     plt.ylabel("Cone Angle (deg)", fontsize=12)
+
+#     plt.xticks(fontsize=11)
+#     plt.yticks(fontsize=11)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=9, frameon=False)
+
+#     plt.tight_layout()
+#     plt.show()
+
+#     return d0, df, emax, u_max_nd, td
+
+
+
+# def plot_performance(history, docking_threshold=0.1):
+
+#     t = np.array(history['t'])
+#     p_c = np.array(history['p_c'])
+#     p_t = np.array(history['p_t'])
+#     v_c = np.array(history['v_c'])
+#     act = np.array(history['action']) # Raw RPMs
+
+#     # -------------------------------------------------
+#     # Distance & Error
+#     # -------------------------------------------------
+#     err_vec = p_c - p_t
+#     dist = np.linalg.norm(err_vec, axis=1)
+
+#     # -------------------------------------------------
+#     # Control Effort (Non-Dimensional Thrust: T / T_hover)
+#     # -------------------------------------------------
+#     start_idx = min(len(t)-1, 50)
+#     hover_rpm = np.mean(act[start_idx:], axis=0)
+    
+#     # Physics: Thrust is proportional to RPM squared
+#     thrust_proxy = np.sum(act**2, axis=1)
+#     hover_thrust_proxy = np.sum(hover_rpm**2) + 1e-6 # Add epsilon to avoid div-by-zero
+    
+#     # Dimensionless Ratio (T / T_hover)
+#     nd_thrust = thrust_proxy / hover_thrust_proxy
+
+#     # -------------------------------------------------
+#     # Compute Quantitative Metrics
+#     # -------------------------------------------------
+#     d0 = dist[0]
+#     df = dist[-1]
+#     emax = np.max(dist)
+    
+#     # Filter out absurd spikes for the print metric
+#     valid_thrust = nd_thrust[start_idx:]
+#     t_max_nd = np.percentile(valid_thrust, 99.5) if len(valid_thrust) > 0 else 1.0
+
+#     idx = np.where(dist < docking_threshold)[0]
+#     td = t[idx[0]] if len(idx) > 0 else None
+    
+
+#     # Raw deviation
+#     act_dev = act - hover_rpm
+#     control_norm = np.linalg.norm(act_dev, axis=1)
+    
+#     # Normalize by the magnitude of the hover state to make it dimensionless
+#     hover_norm = np.linalg.norm(hover_rpm) + 1e-6 # Add epsilon to avoid div by zero
+#     normalized_control = control_norm / hover_norm
+
+#     print("\n--- PERFORMANCE METRICS ---")
+#     print(f"Initial Distance d0        : {d0:.4f} m")
+#     print(f"Final Distance df          : {df:.4f} m")
+#     print(f"Maximum Tracking Error     : {emax:.4f} m")
+#     print(f"Peak Thrust Ratio (99.5%)  : {t_max_nd:.4f}")
+#     print(f"Docking Time td            : {td:.4f} s" if td else "Docking Time td: Not reached")
+#     print("--------------------------------\n")
+
+#     # -------------------------------------------------
+#     # --- PLOTS ---
+#     # -------------------------------------------------
+
+#     # 1. 3D TRAJECTORY
+#     fig1 = plt.figure(figsize=(10, 8))
+#     ax1 = fig1.add_subplot(111, projection='3d')
+#     ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
+#     ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
+#     ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
+#     ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
+#     ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+#     ax1.legend()
+
+#     # 2. POSITION EVOLUTION
+#     fig2 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, p_t[:,0], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,0], 'b-', label='X')
+#     plt.plot(t, p_t[:,1], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,1], 'r-', label='Y')
+#     plt.plot(t, p_t[:,2], 'g--', alpha=0.4)
+#     plt.plot(t, p_c[:,2], 'k-', label='Z')
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Position (m)")
+#     plt.grid(True)
+#     plt.legend()
+
+#     # 3. TRACKING ERROR (Scaled for Paper)
+#     fig3 = plt.figure(figsize=(4.5, 3.4), dpi=300)
+#     plt.plot(t, err_vec[:,0], color='#1f77b4', linewidth=2.0, label='Err X')
+#     plt.plot(t, err_vec[:,1], color='#d62728', linewidth=2.0, label='Err Y')
+#     plt.plot(t, err_vec[:,2], color='black', linewidth=2.0, label='Err Z')
+#     plt.axhline(0, color='gray', linestyle=':', linewidth=1)
+#     plt.xlabel("Time (s)", fontsize=13)
+#     plt.ylabel("Tracking Error (m)", fontsize=13)
+#     plt.xticks(fontsize=12)
+#     plt.yticks(fontsize=12)
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=10, frameon=True)
+#     plt.tight_layout(pad=1.2)
+#     plt.subplots_adjust(bottom=0.18) 
+
+#     # 4. VELOCITY
+#     fig4 = plt.figure(figsize=(10, 6))
+#     plt.plot(t, v_c[:,0], label='Vx')
+#     plt.plot(t, v_c[:,1], label='Vy')
+#     plt.plot(t, v_c[:,2], label='Vz')
+#     plt.xlabel("Time (s)")
+#     plt.ylabel("Velocity (m/s)")
+#     plt.grid(True)
+#     plt.legend()
+
+#     # 5. CONTROL EFFORT (Non-Dimensional Thrust)
+#     fig5 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+
+#     # Large smoothing window for clean trend
+#     window = 35
+#     thrust_smooth = np.convolve(
+#         nd_thrust,
+#         np.ones(window)/window,
+#         mode='same'
+#     )
+
+#     # Raw (noisy, thin)
+#     plt.plot(t, nd_thrust,
+#             color='#1f77b4',
+#             linewidth=1.0,
+#             label='Raw Thrust')
+
+#     # Clean moving average (smooth curve)
+#     plt.plot(t, thrust_smooth,
+#             color='black',
+#             linestyle='--',
+#             linewidth=2.5,
+#             label='Moving Avg')
+            
+#     # Add a baseline for 1.0 (Hover Thrust)
+#     plt.axhline(1.0, color='gray', linestyle=':', linewidth=1.5, label='Hover State')
+
+#     plt.xlabel("Time (s)", fontsize=12)
+#     plt.ylabel(r"Norm. Thrust ($T / T_{hover}$)", fontsize=12) 
+#     plt.xticks(fontsize=11)
+#     plt.yticks(fontsize=11)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=9, frameon=False, loc='best')
+#     plt.tight_layout()
+    
+#     # 6. DOCKING CONE CONSTRAINT (Terminal Zoom)
+#     fig6 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+#     rel_vec = p_c - p_t
+#     rel_norm = np.linalg.norm(rel_vec, axis=1)
+#     a_hat = np.array([0, 0, 1])
+#     cos_theta = np.dot(rel_vec, a_hat) / (rel_norm + 1e-6)
+#     cos_theta = np.clip(cos_theta, -1.0, 1.0)
+#     theta = np.arccos(cos_theta)
+#     theta_cone = np.deg2rad(30)
+
+#     t_end = t[-1]
+#     mask = t >= (t_end - 3.0)
+
+#     plt.plot(t[mask], np.rad2deg(theta[mask]), color='#1f77b4', linewidth=2.2, label=r'$\theta(t)$')
+#     plt.axhline(np.rad2deg(theta_cone), color='black', linestyle='--', linewidth=1.8, label=r'$\theta_{cone}$')
+#     plt.xlabel("Time (s)", fontsize=12)
+#     plt.ylabel("Cone Angle (deg)", fontsize=12)
+#     plt.xticks(fontsize=11)
+#     plt.yticks(fontsize=11)
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=9, frameon=False)
+#     plt.tight_layout()
+
+    
+    
+#     fig7 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+
+#     # Large smoothing window for clean trend
+#     window = 35
+#     control_smooth = np.convolve(
+#         normalized_control,
+#         np.ones(window)/window,
+#         mode='same'
+#     )
+
+#     # Raw (noisy, thin)
+#     plt.plot(t, normalized_control,
+#             color='#1f77b4',
+#             linewidth=1.0,
+#             label='Raw')
+
+#     # Clean moving average (smooth curve)
+#     plt.plot(t, control_smooth,
+#             color='black',
+#             linestyle='--',
+#             linewidth=2.5,
+#             label='Moving Avg')
+
+#     plt.xlabel("Time (s)", fontsize=12)
+#     # Updated Y-label to reflect dimensionless ratio
+#     plt.ylabel(r"Normalized $||\Delta u||$", fontsize=12) 
+#     plt.xticks(fontsize=11)
+#     plt.yticks(fontsize=11)
+
+#     plt.grid(True, linestyle=':', alpha=0.4)
+#     plt.legend(fontsize=9, frameon=False, loc='best')
+
+#     plt.tight_layout()
+    
+#     plt.show()
+    
+
+#     return d0, df, emax, t_max_nd, td
+
+
+def plot_performance(history, docking_threshold=0.15):
+
+    t = np.array(history['t'])
+    p_c = np.array(history['p_c'])
+    p_t = np.array(history['p_t'])
+    v_c = np.array(history['v_c'])
+    act = np.array(history['action']) # Raw RPMs
+
+    # -------------------------------------------------
+    # 1. Truncate Data EXACTLY at Docking Time
+    # -------------------------------------------------
+    err_vec_temp = p_c - p_t
+    dist_temp = np.linalg.norm(err_vec_temp, axis=1)
+    
+    idx = np.where(dist_temp < docking_threshold)[0]
+    if len(idx) > 0:
+        dock_idx = idx[0]
+        # Cut off all arrays at the docking frame
+        t = t[:dock_idx+1]
+        p_c = p_c[:dock_idx+1]
+        p_t = p_t[:dock_idx+1]
+        v_c = v_c[:dock_idx+1]
+        act = act[:dock_idx+1]
+    
+    # -------------------------------------------------
+    # Recompute Final Metrics on Truncated Data
+    # -------------------------------------------------
+    err_vec = p_c - p_t
+    dist = np.linalg.norm(err_vec, axis=1)
+
+    start_idx = min(len(t)-1, 50)
+    hover_rpm = np.mean(act[start_idx:], axis=0)
+    
+    # Thrust proxy (T / T_hover)
+    thrust_proxy = np.sum(act**2, axis=1)
+    hover_thrust_proxy = np.sum(hover_rpm**2) + 1e-6
+    nd_thrust = thrust_proxy / hover_thrust_proxy
+
+    # Normalized Delta u
+    act_dev = act - hover_rpm
+    control_norm = np.linalg.norm(act_dev, axis=1)
+    hover_norm = np.linalg.norm(hover_rpm) + 1e-6 
+    normalized_control = control_norm / hover_norm
+
+    # -------------------------------------------------
+    # Compute Quantitative Metrics
+    # -------------------------------------------------
+    d0 = dist[0]
+    df = dist[-1]
+    emax = np.max(dist)
+    td = t[-1] # Since we truncated, the last time is the docking time
+    
+    valid_thrust = nd_thrust[start_idx:]
+    t_max_nd = np.percentile(valid_thrust, 99.5) if len(valid_thrust) > 0 else 1.0
+
+    print("\n--- PERFORMANCE METRICS ---")
+    print(f"Initial Distance d0        : {d0:.4f} m")
+    print(f"Final Distance df          : {df:.4f} m")
+    print(f"Maximum Tracking Error     : {emax:.4f} m")
+    print(f"Peak Thrust Ratio (99.5%)  : {t_max_nd:.4f}")
+    print(f"Docking Time td            : {td:.4f} s")
+    print("--------------------------------\n")
+
+    # Dynamic smoothing window based on data length
+    window = min(35, max(1, len(t) // 5))
+
+    # -------------------------------------------------
+    # --- PLOTS ---
+    # -------------------------------------------------
+
+    # 1. 3D TRAJECTORY
+    fig1 = plt.figure(figsize=(10, 8))
+    ax1 = fig1.add_subplot(111, projection='3d')
+    ax1.plot(p_t[:,0], p_t[:,1], p_t[:,2], 'g--', label='Target')
+    ax1.plot(p_c[:,0], p_c[:,1], p_c[:,2], 'b-', linewidth=2, label='Chaser')
+    ax1.scatter(p_c[0,0], p_c[0,1], p_c[0,2], c='k', marker='o', label='Start')
+    ax1.scatter(p_c[-1,0], p_c[-1,1], p_c[-1,2], c='r', marker='*', s=100, label='End')
+    ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+    ax1.legend()
+
+    # 2. POSITION EVOLUTION
+    fig2 = plt.figure(figsize=(10, 6))
+    plt.plot(t, p_t[:,0], 'g--', alpha=0.4)
+    plt.plot(t, p_c[:,0], 'b-', label='X')
+    plt.plot(t, p_t[:,1], 'g--', alpha=0.4)
+    plt.plot(t, p_c[:,1], 'r-', label='Y')
+    plt.plot(t, p_t[:,2], 'g--', alpha=0.4)
+    plt.plot(t, p_c[:,2], 'k-', label='Z')
+    plt.xlabel("Time (s)")
+    plt.ylabel("Position (m)")
+    plt.grid(True)
+    plt.legend()
+
+    # 3. TRACKING ERROR (Scaled for Paper)
+    fig3 = plt.figure(figsize=(4.5, 3.4), dpi=300)
+    plt.plot(t, err_vec[:,0], color='#1f77b4', linewidth=2.0, label='Err X')
+    plt.plot(t, err_vec[:,1], color='#d62728', linewidth=2.0, label='Err Y')
+    plt.plot(t, err_vec[:,2], color='black', linewidth=2.0, label='Err Z')
+    plt.axhline(0, color='gray', linestyle=':', linewidth=1)
+    plt.xlabel("Time (s)", fontsize=13)
+    plt.ylabel("Tracking Error (m)", fontsize=13)
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.legend(fontsize=10, frameon=True)
+    plt.tight_layout(pad=1.2)
+    plt.subplots_adjust(bottom=0.18) 
+
+    # 4. VELOCITY
+    fig4 = plt.figure(figsize=(10, 6))
+    plt.plot(t, v_c[:,0], label='Vx')
+    plt.plot(t, v_c[:,1], label='Vy')
+    plt.plot(t, v_c[:,2], label='Vz')
+    plt.xlabel("Time (s)")
+    plt.ylabel("Velocity (m/s)")
+    plt.grid(True)
+    plt.legend()
+
+    # 5. CONTROL EFFORT (Non-Dimensional Thrust)
+    fig5 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+    thrust_smooth = np.convolve(nd_thrust, np.ones(window)/window, mode='same')
+    plt.plot(t, nd_thrust, color='#1f77b4', linewidth=1.0, label='Raw Thrust')
+    plt.plot(t, thrust_smooth, color='black', linestyle='--', linewidth=2.5, label='Moving Avg')
+    plt.axhline(1.0, color='gray', linestyle=':', linewidth=1.5, label='Hover State')
+    if len(t) > start_idx:
+        p_min, p_max = np.percentile(valid_thrust, 1), np.percentile(valid_thrust, 99)
+        margin = max(0.05, (p_max - p_min) * 0.2)
+        plt.ylim(max(0, p_min - margin), p_max + margin)
+    plt.xlabel("Time (s)", fontsize=12)
+    plt.ylabel(r"Norm. Thrust ($T / T_{hover}$)", fontsize=12) 
+    plt.xticks(fontsize=11)
+    plt.yticks(fontsize=11)
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.legend(fontsize=9, frameon=False, loc='best')
+    plt.tight_layout()
+    
+    # 6. DOCKING CONE CONSTRAINT (Terminal Zoom)
+    fig6 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+    rel_vec = p_c - p_t
+    rel_norm = np.linalg.norm(rel_vec, axis=1)
+    a_hat = np.array([0, 0, 1])
+    cos_theta = np.dot(rel_vec, a_hat) / (rel_norm + 1e-6)
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+    theta_cone = np.deg2rad(30)
+    # Ensure t_end logic works even if truncated time is short
+    mask = t >= max(0, t[-1] - 3.0)
+    plt.plot(t[mask], np.rad2deg(theta[mask]), color='#1f77b4', linewidth=2.2, label=r'$\theta(t)$')
+    plt.axhline(np.rad2deg(theta_cone), color='black', linestyle='--', linewidth=1.8, label=r'$\theta_{cone}$')
+    plt.xlabel("Time (s)", fontsize=12)
+    plt.ylabel("Cone Angle (deg)", fontsize=12)
+    plt.xticks(fontsize=11)
+    plt.yticks(fontsize=11)
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.legend(fontsize=9, frameon=False)
+    plt.tight_layout()
+
+    # 7. DELTA U NORMALIZED
+    fig7 = plt.figure(figsize=(4.2, 3.0), dpi=300)
+    control_smooth = np.convolve(normalized_control, np.ones(window)/window, mode='same')
+    plt.plot(t, normalized_control, color='#1f77b4', linewidth=1.0, label='Raw')
+    plt.plot(t, control_smooth, color='black', linestyle='--', linewidth=2.5, label='Moving Avg')
+    plt.xlabel("Time (s)", fontsize=12)
+    plt.ylabel(r"Normalized $||\Delta u||$", fontsize=12) 
+    plt.xticks(fontsize=11)
+    plt.yticks(fontsize=11)
+    plt.grid(True, linestyle=':', alpha=0.4)
+    plt.legend(fontsize=9, frameon=False, loc='best')
+    plt.tight_layout()
+    
+    plt.show()
+
+    return d0, df, emax, t_max_nd, td
+
+
+# ======================================================================
+# 3. VISUALIZATION HELPERS
+# ======================================================================
+def create_hull(radius, color, client):
+    vis = p.createVisualShape(p.GEOM_SPHERE, radius=radius, rgbaColor=color, physicsClientId=client)
+    body = p.createMultiBody(baseVisualShapeIndex=vis, basePosition=[0,0,0], physicsClientId=client)
+    return body
+
+def update_hull(body, pos, client):
+    p.resetBasePositionAndOrientation(body, pos, [0,0,0,1], physicsClientId=client)
+
+def draw_planned_path(traj, client, target_pos, axis, angle):
+    """
+    Clears old debug lines, RESTORES the cone, and draws the new path.
+    """
+    # 1. Clear everything (Old path, old cone, old collision lines)
+    p.removeAllUserDebugItems(physicsClientId=client)
+    
+    # 2. Restore the Cone immediately
+    visualize_docking_cone(target_pos, axis, angle, client=client)
+    
+    # 3. Draw the new Trajectory
+    if traj is None: return
+    for i in range(len(traj) - 1):
+        p.addUserDebugLine(traj[i], traj[i+1], [0, 0, 1], 3, physicsClientId=client)
+
+def create_spherical_obstacle(p_obs, r_obs, client):
+    col = p.createCollisionShape(p.GEOM_SPHERE, radius=r_obs, physicsClientId=client)
+    vis = p.createVisualShape(p.GEOM_SPHERE, radius=r_obs, rgbaColor=[1,0,0,0.8], physicsClientId=client)
+    p.createMultiBody(0, col, vis, p_obs, physicsClientId=client)
+    
+def visualize_docking_cone(p_goal, axis, angle_deg, length=2.0, client=0):
+    axis = axis / np.linalg.norm(axis)
+    cone_dir_main = -axis 
+    theta = np.deg2rad(angle_deg)
+    
+    # Construct Basis
+    if np.abs(axis[2]) < 0.9: ref = np.array([0,0,1])
+    else: ref = np.array([0,1,0])
+    u = np.cross(axis, ref); u = u/np.linalg.norm(u)
+    v = np.cross(axis, u)
+    
+    # Draw Rim (Green)
+    for phi in np.linspace(0, 2*np.pi, 30):
+        radial = u*np.cos(phi) + v*np.sin(phi)
+        vec = cone_dir_main * np.cos(theta) + radial * np.sin(theta)
+        end_pos = p_goal + vec * length
+        p.addUserDebugLine(p_goal, end_pos, [0,1,0], 2, physicsClientId=client)
+    
+    # Draw Center Axis (RED & THICK)
+    p.addUserDebugLine(p_goal, p_goal + cone_dir_main*length, [1,0,0], 5, physicsClientId=client)
+    
+
+# ======================================================================
+# 4. MAIN INTEGRATED EXECUTION
+# ======================================================================
+# MAIN EXECUTION
+# ======================================================================
+def run():
+    # --- FAIR COMPARISON SETUP (Matches Moving Targets) ---
+    SIM_FREQ = 240
+    CTRL_FREQ = 48
+    DURATION_SEC = 20.0
+    
+    CHASER_START = np.array([-2.5, 0.0, 1.5])
+    TARGET_POS   = np.array([ 0.5, 0.0, 1.0]) 
+    P_OBS        = np.array([-1.0, 0.0, 1.25]) 
+    R_OBS        = 0.4
+
+    # 1. INITIAL PLAN
+    print("\n[INIT] Calculating Initial Trajectory...")
+    current_plan = plan_scp_docking(
+        p_start=CHASER_START,
+        v_start=np.zeros(3),
+        p_goal=TARGET_POS,
+        p_obs=P_OBS,
+        r_obs=R_OBS + 0.2,
+        docking_axis=DOCKING_AXIS,
+        cone_angle_deg=CONE_ANGLE,
+        N=int(CTRL_FREQ * DURATION_SEC),
+        dt=1/CTRL_FREQ
+    )
+
+    # 2. ENVIRONMENT SETUP
+    env = CtrlAviary(
+        drone_model=DroneModel.CF2X,
+        num_drones=2,
+        initial_xyzs=np.array([CHASER_START, TARGET_POS]),
+        initial_rpys=np.zeros((2,3)),
+        physics=Physics.PYB_DW,   # <--- DOWNWASH ENABLED
+        neighbourhood_radius=0.2,
+        pyb_freq=SIM_FREQ,
+        ctrl_freq=CTRL_FREQ,
+        gui=True,
+        obstacles=False
+    )
+    PYB_CLIENT = env.getPyBulletClient()
+
+    # 3. VISUALS SETUP
+    create_spherical_obstacle(P_OBS, R_OBS, PYB_CLIENT)
+    visualize_docking_cone(TARGET_POS, DOCKING_AXIS, CONE_ANGLE, client=PYB_CLIENT)
+    
+    hull_c = create_hull(SAFETY_R, [0, 1, 1, 0.3], PYB_CLIENT) 
+    hull_t = create_hull(SAFETY_R, [1, 0, 1, 0.3], PYB_CLIENT) 
+
+    if current_plan is not None:
+        draw_planned_path(current_plan, PYB_CLIENT, TARGET_POS, DOCKING_AXIS, CONE_ANGLE)
+    else:
+        print("[ERROR] Initial Plan Failed!")
+        env.close(); return
+
+    # 4. CONTROLLERS & STATE
+    ctrl = [DSLPIDControl(drone_model=DroneModel.CF2X) for _ in range(2)]
+    action = np.zeros((2,4))
+    
+    state = STATE_TRACKING
+    traj_idx = 0
+    START = time.time()
+    
+    # Retreat Logic Variables
+    backoff_start_pos = None
+    backoff_end_pos   = None
+    backoff_t_start   = 0
+    BACKOFF_DURATION  = 2.5 
+    
+    # Freeze Logic Variables
+    frozen = False
+    freeze_pos_c = None
+    freeze_pos_t = None
+
+    history = {
+        't': [], 
+        'p_c': [], 'p_t': [], 
+        'v_c': [], 'action': []
+    }
+
+    print("[SIM] Running Static Target SCP Docking...")
+    
+    try:
+        # --- MAIN LOOP ---
+        for i in range(int(DURATION_SEC * CTRL_FREQ)):
+            sim_t = i / CTRL_FREQ
+            
+            # 0. CHECK WINDOW STATUS
+            if not p.isConnected(physicsClientId=PYB_CLIENT):
+                print("\n[USER] Window closed. Finishing...")
+                break
+            
+            # 1. FREEZE LOGIC (If docked, freeze in space but keep logging time)
+            if frozen:
+                p.resetBasePositionAndOrientation(env.DRONE_IDS[0], freeze_pos_c, [0,0,0,1], physicsClientId=PYB_CLIENT)
+                p.resetBasePositionAndOrientation(env.DRONE_IDS[1], freeze_pos_t, [0,0,0,1], physicsClientId=PYB_CLIENT)
+                
+                # Continue logging so plot goes all the way to 20s
+                history['t'].append(sim_t)
+                history['p_c'].append(freeze_pos_c.copy())
+                history['p_t'].append(freeze_pos_t.copy())
+                history['v_c'].append(np.zeros(3))
+                
+                # Keep control effort flat during freeze
+                hover_rpm = np.mean(history['action'][-50:], axis=0) if len(history['action']) > 0 else np.zeros(4)
+                history['action'].append(hover_rpm.copy())
+
+                env.render()
+                sync(i, START, env.CTRL_TIMESTEP)
+                continue
+            
+            # 2. STEP SIMULATION
+            obs, _, _, _, _ = env.step(action)
+            
+            p_chaser = obs[0][0:3]
+            v_chaser = obs[0][10:13]
+            p_target = obs[1][0:3]
+            true_state = obs[1]
+
+            # Visuals Update
+            update_hull(hull_c, p_chaser, PYB_CLIENT)
+            update_hull(hull_t, p_target, PYB_CLIENT)
+
+            # 3. APPLY ENVIRONMENTAL DISTURBANCE (WIND)
+            gust = np.random.uniform(-WIND_GUST_AMP, WIND_GUST_AMP, 3)
+            current_wind_force = WIND_NOMINAL + gust
+            p.applyExternalForce(env.DRONE_IDS[0], -1, current_wind_force, p_chaser, p.WORLD_FRAME, PYB_CLIENT)
+            p.addUserDebugLine(p_chaser, p_chaser + current_wind_force*0.5, [1, 1, 0], 2, 0.1, physicsClientId=PYB_CLIENT)
+
+            # --- DOCKING COMPLETION CHECK ---
+            dist_real = np.linalg.norm(p_chaser - p_target)
+            if dist_real < 0.15:
+                frozen = True
+                freeze_pos_c = p_chaser
+                freeze_pos_t = p_target
+                
+                print(f"\n[COMPLETE] DOCKED SUCCESSFULLY!")
+                print(f">>> Total Docking Time: {sim_t:.2f} seconds <<<")
+                
+                # Log the exact final moment
+                history['t'].append(sim_t)
+                history['p_c'].append(obs[0][0:3].copy())
+                history['p_t'].append(obs[1][0:3].copy())
+                history['v_c'].append(obs[0][10:13].copy())
+                history['action'].append(action[0].copy())
+                
+                plot_performance(history)
+                continue
+
+            # 4. FINITE STATE MACHINE (FSM)
+            if state == STATE_TRACKING:
+                # SAFETY CHECK (DCOL)
+                alpha, contact_pt = solve_dcol_scaling(p_chaser, SAFETY_R, P_OBS, R_OBS)
+                remaining_steps = len(current_plan) - traj_idx if current_plan is not None else 0
+                
+                if alpha < ALPHA_LIMIT and remaining_steps > 20:
+                    print(f"\n[SAFETY TRIGGER] Alpha {alpha:.3f} < {ALPHA_LIMIT}. WIND CAUSED DEVIATION! BACKING OFF.")
+                    p.changeVisualShape(hull_c, -1, rgbaColor=[1, 0, 0, 0.8], physicsClientId=PYB_CLIENT)
+                    
+                    # Setup Smooth Retreat
+                    backoff_start_pos = p_chaser.copy()
+                    vec_away = p_chaser - P_OBS
+                    if np.linalg.norm(vec_away) < 0.01: vec_away = np.array([-1.0, 0, 0])
+                    vec_away = vec_away / np.linalg.norm(vec_away)
+                    
+                    backoff_end_pos = P_OBS + vec_away * ((R_OBS + SAFETY_R) * 1.5) + np.array([0,0,0.5])
+                    backoff_t_start = time.time()
+                    state = STATE_BACKING_OFF
+
+                # TRACKING
+                elif current_plan is not None and traj_idx < len(current_plan):
+                    target_pt = current_plan[traj_idx]
+                    target_vel = (current_plan[traj_idx] - current_plan[traj_idx-1])*CTRL_FREQ if traj_idx > 0 else np.zeros(3)
+                    action[0], _, _ = ctrl[0].computeControlFromState(env.CTRL_TIMESTEP, obs[0], target_pt, target_vel)
+                    traj_idx += 1
+                else:
+                    action[0], _, _ = ctrl[0].computeControlFromState(env.CTRL_TIMESTEP, obs[0], TARGET_POS, np.zeros(3))
+
+            elif state == STATE_BACKING_OFF:
+                t_elapsed = time.time() - backoff_t_start
+                progress = min(t_elapsed / BACKOFF_DURATION, 1.0)
+                alpha_t = progress * progress * (3 - 2 * progress)
+                
+                current_setpoint = (1 - alpha_t) * backoff_start_pos + alpha_t * backoff_end_pos
+                action[0], _, _ = ctrl[0].computeControlFromState(env.CTRL_TIMESTEP, obs[0], current_setpoint, np.zeros(3))
+                
+                if progress >= 1.0:
+                    print(">>> Safety Reached. Replanning...")
+                    state = STATE_REPLANNING
+
+            elif state == STATE_REPLANNING:
+                action[0], _, _ = ctrl[0].computeControlFromState(env.CTRL_TIMESTEP, obs[0], p_chaser, np.zeros(3))
+                
+                new_plan = plan_scp_docking(
+                    p_start=p_chaser, v_start=v_chaser, 
+                    p_goal=TARGET_POS, p_obs=P_OBS, r_obs=R_OBS+ 0.2,
+                    docking_axis=DOCKING_AXIS, cone_angle_deg=CONE_ANGLE,
+                    N=int(CTRL_FREQ * 15), dt=1/CTRL_FREQ
+                )
+                
+                if new_plan is not None:
+                    current_plan = new_plan
+                    traj_idx = 0
+                    draw_planned_path(current_plan, PYB_CLIENT, TARGET_POS, DOCKING_AXIS, CONE_ANGLE)
+                    p.changeVisualShape(hull_c, -1, rgbaColor=[0, 1, 1, 0.3], physicsClientId=PYB_CLIENT)
+                    print(">>> Replan Successful. Resuming Approach.")
+                    state = STATE_TRACKING
+                else:
+                    print(">>> Replan Failed. Trying again...")
+
+            # Target (Static Hover)
+            action[1], _, _ = ctrl[1].computeControlFromState(env.CTRL_TIMESTEP, obs[1], TARGET_POS, np.zeros(3))
+            
+            # 5. LOGGING (Capturing precise u*)
+            history['t'].append(sim_t)
+            history['p_c'].append(obs[0][0:3].copy())
+            history['p_t'].append(true_state[0:3].copy())
+            history['v_c'].append(obs[0][10:13].copy())
+            history['action'].append(action[0].copy())
+
+            env.render()
+            sync(i, START, env.CTRL_TIMESTEP)
+
+    except Exception as e:
+        print(f"\n[INFO] Simulation ended: {e}")
+        
+    finally:
+        try: env.close()
+        except: pass
+        
+        # Only plot if we didn't already plot during the Docking Check
+        if not frozen:
+            print("[PLOTS] Time expired. Generating Performance Plots...")
+            plot_performance(history)
+
+
+if __name__ == "__main__":
+    run()
