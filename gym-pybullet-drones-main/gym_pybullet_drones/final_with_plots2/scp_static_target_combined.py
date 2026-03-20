@@ -25,7 +25,7 @@ DURATION_SEC = 20.0
 DOCKING_AXIS = np.array([0.0, 0.0, -1.0]) 
 CONE_ANGLE   = 30    
 SAFETY_R     = 0.1   
-ALPHA_LIMIT  = 1.05  
+ALPHA_LIMIT  = 1.05
 
 # Wind
 WIND_NOMINAL  = np.array([0.5, -0.3, -0.1]) 

@@ -32,7 +32,7 @@ WIND_NOMINAL  = np.array([0.5, -0.3, -0.1])
 WIND_GUST_AMP = 0.1                         
 
 # FSM States
-STATE_TRACKING    = 0
+STATE_TRACKING    = 0,
 STATE_BACKING_OFF = 1
 STATE_REPLANNING  = 2
 
