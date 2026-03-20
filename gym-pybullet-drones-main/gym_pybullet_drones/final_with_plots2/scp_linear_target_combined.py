@@ -1021,7 +1021,7 @@ def run():
                         print(f"[PHASE] {sim_t:.2f}s | Switched to Terminal Phase (Diving in!)")
 
                 # --- DOCKING COMPLETION CHECK (Wind-Relaxed) ---
-                if docking_phase == 1 and np.linalg.norm(p_chaser - p_target) < 0.15:
+                if docking_phase == 1 and np.linalg.norm(p_chaser - p_target) < 0.2:
                     frozen = True
                     freeze_pos_c = p_chaser
                     freeze_pos_t = p_target
