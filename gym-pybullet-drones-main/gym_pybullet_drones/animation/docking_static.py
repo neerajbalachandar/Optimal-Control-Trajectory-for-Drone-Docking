@@ -29,10 +29,9 @@ STATE_TRACK_KD = np.array([1.0, 1.0, 1.6])
 FEEDBACK_ACCEL_CLIP = 6.0
 SCP_ACCEL_CLIP = 15.0
 
-# Terminal docking controller once SCP horizon ends (NOT neutral hover).
+# Terminal hover gains once SCP horizon ends.
 HOVER_KP = np.array([1.8, 1.8, 2.6])
 HOVER_KD = np.array([1.1, 1.1, 1.6])
-DOCK_DESCENT_BIAS = 0.8
 
 # Geometric attitude control gains (body-axis torque command, N*m).
 K_R_NORM = np.array([2200.0, 2200.0, 1800.0])
@@ -335,7 +334,6 @@ def run(
     dt_scp = scp["dt"]
     chaser_init = scp["x0"][0:3]
     target_pos = scp["p_target"].copy()
-    dock_axis = scp["cone_axis"] / (np.linalg.norm(scp["cone_axis"]) + 1e-9)
 
     env = CtrlAviary(
         drone_model=DroneModel.CF2X,
@@ -420,13 +418,7 @@ def run(
                 feedback_acc = np.clip(feedback_acc, -FEEDBACK_ACCEL_CLIP, FEEDBACK_ACCEL_CLIP)
                 accel_cmd += feedback_acc
         else:
-            rel_to_target = target_pos - chaser_pos
-            accel_cmd = HOVER_KP * rel_to_target - HOVER_KD * chaser_vel
-
-            # Phase-2 docking bias: keep descending along cone axis until final capture.
-            axial_gap = float(np.dot(rel_to_target, dock_axis))
-            if axial_gap > dock_dist_tol:
-                accel_cmd += DOCK_DESCENT_BIAS * dock_axis
+            accel_cmd = HOVER_KP * (target_pos - chaser_pos) - HOVER_KD * chaser_vel
 
         accel_cmd = np.clip(accel_cmd, -SCP_ACCEL_CLIP, SCP_ACCEL_CLIP)
         action[0] = accel_to_rpm(accel_cmd, chaser, env, yaw_des_rad=DEFAULT_YAW_RAD)

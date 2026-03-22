@@ -1,10 +1,19 @@
 import numpy as np
 import cvxpy as cp
 import matplotlib.pyplot as plt
+import sys
+from pathlib import Path
+
+if __package__ is None or __package__ == "":
+    theory_dir = Path(__file__).resolve().parent
+    if str(theory_dir) not in sys.path:
+        sys.path.insert(0, str(theory_dir))
+
+from drone_dynamics import build_double_integrator_matrices, drone_accel_constraints
 
 # ================= SYSTEM =================
 dt = 0.1
-N = 25
+N = 20
 time_steps = np.arange(N) * dt
 ctrl_steps = np.arange(N-1) * dt
 
@@ -26,12 +35,9 @@ x0 = np.array([-2.5, 0.0, 1.5, 0.0, 0.0, 0.0])
 p_target = np.array([0.5, 0.0, 1.0])
 
 # ================= DYNAMICS =================
-A_d = np.eye(6)
-A_d[0:3, 3:6] = dt * np.eye(3)
-
-B_d = np.zeros((6, 3))
-B_d[0:3, :] = 0.5 * dt**2 * np.eye(3)
-B_d[3:6, :] = dt * np.eye(3)
+# Translational [p,v] propagation with drone-feasible acceleration constraints
+# imported from theory/drone_dynamics.py.
+A_d, B_d = build_double_integrator_matrices(dt)
 
 # ================= DCOL (Tracy et al.) =================
 def alpha(pc):
@@ -127,7 +133,7 @@ for it in range(MAX_ITERS):
             con += [slack_cone[k] == 0]
             
         # 5. Physical Limits
-        con += [cp.norm(u[k, :], np.inf) <= U_MAX]
+        con += drone_accel_constraints(cp, u[k, :], u_inf_max=U_MAX)
         con += [cp.norm(x[k+1, 3:6], 2) <= V_MAX]
 
     con += [cp.norm(x[-1, :] - x_nom[-1, :], np.inf) <= trust_radius]
