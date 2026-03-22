@@ -30,6 +30,7 @@ TRACK_POS_KP = np.array([1.2, 1.2, 1.8])
 TRACK_POS_KD = np.array([1.0, 1.0, 1.4])
 DOCK_POS_KP = np.array([1.8, 1.8, 2.6])
 DOCK_POS_KD = np.array([1.2, 1.2, 1.8])
+DOCK_DESCENT_BIAS = 0.8
 
 # Geometric attitude gains that generate desired angular acceleration (rad/s^2).
 ATT_KR = np.array([2200.0, 2200.0, 1800.0])
@@ -316,6 +317,7 @@ def stabilized_rpm_command(
     vel_ref: np.ndarray,
     pos_kp: np.ndarray,
     pos_kd: np.ndarray,
+    accel_bias_world: np.ndarray,
     env: CtrlAviary,
 ) -> np.ndarray:
     pos = obs_chaser[0:3]
@@ -332,6 +334,7 @@ def stabilized_rpm_command(
     # Feedforward force from SCP and feedback correction from position and velocity tracking.
     force_ff_world = float(thrust_ff_n) * b3_ff
     accel_fb = pos_kp * (pos_ref - pos) + pos_kd * (vel_ref - vel_world)
+    accel_fb += np.asarray(accel_bias_world, dtype=float)
     accel_fb = np.clip(accel_fb, -TRACK_ACCEL_CLIP, TRACK_ACCEL_CLIP)
     force_fb_world = env.M * accel_fb
     force_cmd_world = force_ff_world + force_fb_world
@@ -388,6 +391,7 @@ def run(
     dt_scp = scp["dt"]
     chaser_init = scp["x0"][0:3]
     target_pos = scp["p_target"].copy()
+    dock_axis = scp["cone_axis"] / (np.linalg.norm(scp["cone_axis"]) + 1e-9)
     q0_wxyz = normalize_quat_wxyz(scp["x0"][6:10])
 
     env = CtrlAviary(
@@ -491,6 +495,7 @@ def run(
             omega_des = x_cmd[10:13] / scp_time_scale
             pos_kp = TRACK_POS_KP
             pos_kd = TRACK_POS_KD
+            accel_bias = np.zeros(3)
         else:
             thrust_ff = float(env.GRAVITY)
             tau_ff = np.zeros(3)
@@ -502,6 +507,13 @@ def run(
             pos_kp = DOCK_POS_KP
             pos_kd = DOCK_POS_KD
 
+            rel_to_target = target_pos - chaser_pos
+            axial_gap = float(np.dot(rel_to_target, dock_axis))
+            if axial_gap > dock_dist_tol:
+                accel_bias = DOCK_DESCENT_BIAS * dock_axis
+            else:
+                accel_bias = np.zeros(3)
+
         action[0] = stabilized_rpm_command(
             obs_chaser=chaser,
             thrust_ff_n=thrust_ff,
@@ -512,6 +524,7 @@ def run(
             vel_ref=vel_ref,
             pos_kp=pos_kp,
             pos_kd=pos_kd,
+            accel_bias_world=accel_bias,
             env=env,
         )
         action[1] = np.zeros(4)
