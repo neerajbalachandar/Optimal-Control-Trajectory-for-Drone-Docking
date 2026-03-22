@@ -266,7 +266,7 @@ def allocate_cf2x_rpm(total_thrust_n: float, tau_cmd_nm: np.ndarray, env: CtrlAv
     alloc = np.array(
         [
             [1.0, 1.0, 1.0, 1.0],
-            [arm, arm, -arm, -arm],
+            [-arm, -arm, arm, arm],
             [-arm, arm, arm, -arm],
             [-yaw_coeff, yaw_coeff, -yaw_coeff, yaw_coeff],
         ]
