@@ -47,9 +47,11 @@ x_nom = np.zeros((N, 6))
 for k in range(N):
     al = k / (N - 1)
     x_nom[k, 0:3] = (1 - al) * x0[0:3] + al * p_target
-    # Lateral bow to avoid dead-center singularity & "glass floor"
+    # Bow laterally AND slightly vertically to avoid diving under the rock
     x_nom[k, 1] += 0.8 * np.sin(np.pi * al) 
-
+    x_nom[k, 2] += 0.5 * np.sin(np.pi * al)
+    
+    
 # ================= TRACKING ARRAYS =================
 cost_history = []
 delta_history = []
@@ -66,11 +68,15 @@ for it in range(MAX_ITERS):
     x = cp.Variable((N, 6))
     u = cp.Variable((N-1, 3))
     
+    # THE FIX: Add Slack variables for the Cone and Target DCOL (Eq. 20)
+    slack_cone = cp.Variable(N-1, nonneg=True)
+    slack_tar  = cp.Variable(N-1, nonneg=True)
+    
     cost = 0
     con = [x[0, :] == x0]
     
     # Terminal Boundary Condition
-    con += [x[-1, 0:3] == p_target]
+    con += [x[-1, 0:3] == p_target] # (Or p_goal if you kept the hover fix)
     con += [x[-1, 3:6] == np.zeros(3)]
     
     for k in range(N-1):
@@ -84,23 +90,51 @@ for it in range(MAX_ITERS):
         # Trust Region
         con += [cp.norm(x[k, :] - x_nom[k, :], np.inf) <= trust_radius]
         
-        # Obstacle Avoidance (Linearized)
         p_nom = x_nom[k, 0:3]
+        
+        # 3. Obstacle Avoidance (Linearized)
         v_obs = p_nom - P_OBS
         d_obs = np.linalg.norm(v_obs) + 1e-8
         n_obs = v_obs / d_obs
         con += [n_obs @ (x[k, 0:3] - P_OBS) >= R_OBS + R_SAFE]
 
-        # Target DCOL Avoidance 
-        if k < N-2: 
-            n_tar = grad_alpha(p_nom) * (r_c + r_t)
-            con += [n_tar @ (x[k, 0:3] - p_target) >= (r_c + r_t) * alpha_min]
+        p_rel_nom = x_nom[k, 0:3]
+        
+        # A. Obstacle Avoidance (Obstacle is moving relative to us! ALWAYS ACTIVE)
+        p_obs_rel = P_OBS
+        v_obs = p_rel_nom - p_obs_rel
+        d_obs = np.linalg.norm(v_obs) + 1e-8
+        n_obs = v_obs / d_obs
+        con += [n_obs @ (x[k, 0:3] - p_obs_rel) >= R_OBS + R_SAFE]
+
+        # B & C. Target DCOL and Docking Cone (SPATIAL THRESHOLDING)
+        # In relative space, distance to target is simply the norm of p_rel_nom!
+        dist_xy = np.linalg.norm(p_rel_nom[0:2])
+        
+        if dist_xy < 1.5:
+            # --- PHASE 1 (TERMINAL DIVE): Turn ON Safety Constraints ---
             
-        # Physical Limits
+            # B. DCOL Collision Avoidance (Target is fixed at origin [0,0,0])
+            dist_tar_nom = np.linalg.norm(p_rel_nom) + 1e-8
+            n_tar = (p_rel_nom / dist_tar_nom) * (r_c + r_t)
+            con += [n_tar @ x[k, 0:3] >= (r_c + r_t) * alpha_min - slack_tar[k]]
+            
+            # C. Docking Cone (Target is fixed at origin [0,0,0])
+            con += [cp.norm(x[k, 0:3]) * np.cos(THETA) <= -N_APP @ x[k, 0:3] + slack_cone[k]]
+        else:
+            # --- PHASE 0 (APPROACH): Turn OFF Safety Constraints ---
+            con += [slack_tar[k] == 0]
+            con += [slack_cone[k] == 0]
+            
+        # 5. Physical Limits
         con += [cp.norm(u[k, :], np.inf) <= U_MAX]
         con += [cp.norm(x[k+1, 3:6], 2) <= V_MAX]
 
     con += [cp.norm(x[-1, :] - x_nom[-1, :], np.inf) <= trust_radius]
+    
+    # THE FIX: Penalize the slacks heavily so the drone obeys the cone/DCOL but doesn't crash the math
+    cost += cp.sum(slack_cone) * 200.0
+    cost += cp.sum(slack_tar) * 200.0
 
     prob = cp.Problem(cp.Minimize(cost), con)
     prob.solve(solver=cp.ECOS)
@@ -183,7 +217,7 @@ ax_v.legend(loc='upper right')
 
 
 # ----------------- FIGURE 3: Safety Constraints -----------------
-fig3, (ax_obs, ax_tar) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+fig3, (ax_obs, ax_tar, ax_cone) = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
 
 # Obstacle Distance
 dist_obs = np.linalg.norm(traj - P_OBS, axis=1)
@@ -204,6 +238,26 @@ ax_tar.set_xlabel('Time (s)')
 ax_tar.set_ylabel('DCOL $\\alpha$ Scale')
 ax_tar.set_title('Target DCOL Safety Factor (Phase 0)')
 ax_tar.legend()
+
+# 3. Docking Cone Angle Tracker
+angles = []
+for p_rel in x_nom[:, 0:3]:
+    dist = np.linalg.norm(p_rel)
+    if dist < 1e-5:
+        angles.append(0.0)
+    else:
+        # Cosine rule for angle between approach axis and relative position
+        cos_phi = np.clip(np.dot(-N_APP, p_rel) / dist, -1.0, 1.0)
+        angles.append(np.degrees(np.arccos(cos_phi)))
+        
+ax_cone.plot(time_steps, angles, 'c', linewidth=2)
+ax_cone.axhline(np.degrees(THETA), color='k', linestyle='--', label=f'Cone Limit ({np.degrees(THETA)}°)')
+ax_cone.fill_between(time_steps, 0, np.degrees(THETA), color='cyan', alpha=0.1)
+ax_cone.set_ylabel('Approach Angle (deg)')
+ax_cone.set_xlabel('Time (s)')
+ax_cone.set_title('Docking Cone Alignment vs. Time')
+ax_cone.legend()
+
 
 
 # ----------------- FIGURE 4: Solver Convergence -----------------
