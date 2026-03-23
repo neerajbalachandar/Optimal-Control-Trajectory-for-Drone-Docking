@@ -19,7 +19,7 @@ from gym_pybullet_drones.utils.utils import str2bool, sync
 
 DEFAULT_SIMULATION_FREQ_HZ = 240
 DEFAULT_CONTROL_FREQ_HZ = 48
-DEFAULT_HOLD_SEC = 6.0
+DEFAULT_HOLD_SEC = 0.0
 
 DEFAULT_YAW_DEG = 0.0
 DEFAULT_YAW_RAD = np.deg2rad(DEFAULT_YAW_DEG)
@@ -27,8 +27,8 @@ DEFAULT_YAW_RAD = np.deg2rad(DEFAULT_YAW_DEG)
 SCP_ACCEL_CLIP = 15.0
 
 # Geometric attitude control gains (body-axis torque command, N*m).
-K_R_NORM = np.array([2200.0, 2200.0, 1800.0])
-K_W_NORM = np.array([140.0, 140.0, 100.0])
+K_R_NORM = np.array([1200.0, 1200.0, 900.0])
+K_W_NORM = np.array([80.0, 80.0, 60.0])
 
 
 def load_scp_linear_ekf_solution(suppress_plots: bool = True):
@@ -300,26 +300,21 @@ def accel_to_rpm(accel_des_world: np.ndarray, obs: np.ndarray, env: CtrlAviary, 
     accel_cmd = np.asarray(accel_des_world, dtype=float).copy()
 
     # Rotorcraft cannot command sustained downward acceleration beyond free-fall.
-    accel_cmd[2] = max(accel_cmd[2], -0.9 * g_acc)
+    accel_cmd[2] = max(accel_cmd[2], -0.95 * g_acc)
 
     force_world_des = env.M * (accel_cmd + np.array([0.0, 0.0, g_acc]))
 
-    # Keep desired force inside motor authority and away from near-zero thrust.
+    # Keep desired force inside motor authority while preserving direction.
     force_norm = np.linalg.norm(force_world_des)
-    min_thrust_n = 0.05 * env.MAX_THRUST
-    max_thrust_n = env.MAX_THRUST
-    if force_norm < 1e-9:
-        force_world_des = np.array([0.0, 0.0, min_thrust_n])
-    else:
-        if force_norm > max_thrust_n:
-            force_world_des *= max_thrust_n / force_norm
-        elif force_norm < min_thrust_n:
-            force_world_des *= min_thrust_n / force_norm
+    if force_norm > env.MAX_THRUST:
+        force_world_des *= env.MAX_THRUST / force_norm
+    elif force_norm < 1e-9:
+        force_world_des = np.array([0.0, 0.0, 1e-6])
 
     rot_des = build_desired_rotation(force_world_des, yaw_des_rad=yaw_des_rad)
 
-    # Use commanded force norm for thrust to avoid transient thrust dropouts.
-    total_thrust_n = float(np.linalg.norm(force_world_des))
+    # Project desired force onto current body-z axis for physically consistent thrust.
+    total_thrust_n = float(np.dot(force_world_des, rot[:, 2]))
     total_thrust_n = np.clip(total_thrust_n, 0.0, env.MAX_THRUST)
 
     rot_err_mat = 0.5 * (rot_des.T @ rot - rot.T @ rot_des)

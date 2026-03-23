@@ -2,6 +2,43 @@ import numpy as np
 import cvxpy as cp
 import matplotlib.pyplot as plt
 
+SCP_SOLVER_ORDER = ("ECOS", "CLARABEL", "SCS")
+ACCEPTABLE_SOLVER_STATUSES = {"optimal", "optimal_inaccurate"}
+
+
+def solve_with_fallback(prob: cp.Problem, warm_start: bool = True) -> str:
+    """Solve SCP subproblem with robust conic solver fallback."""
+    installed = set(cp.installed_solvers())
+    attempted = []
+    last_status = None
+
+    for solver_name in SCP_SOLVER_ORDER:
+        if solver_name not in installed:
+            continue
+        attempted.append(solver_name)
+
+        solver_kwargs = {}
+        if solver_name == "SCS":
+            solver_kwargs["max_iters"] = 6000
+            solver_kwargs["eps"] = 1e-4
+
+        try:
+            prob.solve(solver=solver_name, warm_start=warm_start, **solver_kwargs)
+        except cp.error.SolverError:
+            continue
+
+        last_status = prob.status
+        if prob.status in ACCEPTABLE_SOLVER_STATUSES:
+            return solver_name
+
+    if not attempted:
+        raise cp.error.SolverError(
+            "No supported conic solver found. Install at least one of: ECOS, CLARABEL, SCS."
+        )
+    raise cp.error.SolverError(
+        f"All SCP solvers failed or returned non-optimal status. Tried {attempted}, last status={last_status}."
+    )
+
 # =====================================================================
 # 1. MULTI-RATE SENSOR FUSION EKF (Target Tracking)
 # =====================================================================
@@ -160,6 +197,8 @@ for sim_step in range(SIM_MAX_STEPS):
         
     trust_radius = 2.0
     scp_converged = False
+    last_prob_value = np.nan
+    last_solver = "none"
     
     # ---------------------------------------------------------
     # 3. SCP OPTIMIZATION (RELATIVE FRAME)
@@ -226,12 +265,17 @@ for sim_step in range(SIM_MAX_STEPS):
         cost += cp.sum(slack_tar) * 100.0
 
         prob = cp.Problem(cp.Minimize(cost), con)
-        prob.solve(solver=cp.ECOS, warm_start=True)
-        
-        if prob.status != "optimal":
+        try:
+            last_solver = solve_with_fallback(prob, warm_start=True)
+        except cp.error.SolverError:
             trust_radius *= 0.5
             continue
-            
+
+        if x_rel.value is None or u.value is None:
+            trust_radius *= 0.5
+            continue
+
+        last_prob_value = float(prob.value) if prob.value is not None else np.nan
         delta = np.linalg.norm(x_rel.value - x_nom, np.inf)
         x_nom = x_rel.value.copy()
         u_nom = u.value.copy() 
@@ -241,7 +285,11 @@ for sim_step in range(SIM_MAX_STEPS):
             break
         trust_radius = np.clip(1.1 * trust_radius, 0.1, 3.0)
 
-    print(f"Step {sim_step:02d} | Cost: {prob.value:.1f} | Dist: {dist_to_goal:.2f} | Vel Err: {vel_error:.2f}")
+    cost_str = f"{last_prob_value:.1f}" if np.isfinite(last_prob_value) else "nan"
+    print(
+        f"Step {sim_step:02d} | Cost: {cost_str} | Dist: {dist_to_goal:.2f} | "
+        f"Vel Err: {vel_error:.2f} | Solver: {last_solver} | SCP Converged: {scp_converged}"
+    )
 
     # 4. Apply Control to TRUE CHASER dynamics (Absolute frame)
     u_cmd = u_nom[0, :]

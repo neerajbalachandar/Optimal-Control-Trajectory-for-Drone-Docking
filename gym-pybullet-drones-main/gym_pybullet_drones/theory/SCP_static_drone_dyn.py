@@ -91,7 +91,7 @@ u_nom[:, 2] = GRAVITY
 
 SIM_MAX_STEPS = 80
 TOL = 1e-3
-MAX_ITERS = 10 
+MAX_ITERS = 5
 
 x_hist = [x0.copy()]
 u_hist = []
