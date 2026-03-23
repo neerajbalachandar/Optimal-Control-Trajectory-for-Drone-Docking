@@ -19,7 +19,7 @@ from gym_pybullet_drones.utils.utils import str2bool, sync
 
 DEFAULT_SIMULATION_FREQ_HZ = 240
 DEFAULT_CONTROL_FREQ_HZ = 48
-DEFAULT_HOLD_SEC = 8.0
+DEFAULT_HOLD_SEC = 6.0
 
 DEFAULT_YAW_DEG = 0.0
 DEFAULT_YAW_RAD = np.deg2rad(DEFAULT_YAW_DEG)
@@ -30,12 +30,10 @@ SCP_ACCEL_CLIP = 15.0
 K_R_NORM = np.array([2200.0, 2200.0, 1800.0])
 K_W_NORM = np.array([140.0, 140.0, 100.0])
 
-# Visual aids
 
-
-def load_scp_static_solution(suppress_plots: bool = True):
-    """Run theory/SCP_static.py and extract its converged trajectories."""
-    scp_path = Path(__file__).resolve().parents[1] / "theory" / "SCP_static.py"
+def load_scp_static_ekf_solution(suppress_plots: bool = True):
+    """Run theory/SCP_static_EKF.py and extract executed trajectories."""
+    scp_path = Path(__file__).resolve().parents[1] / "theory" / "SCP_static_EKF.py"
     if not scp_path.exists():
         raise FileNotFoundError(f"Could not find SCP file: {scp_path}")
 
@@ -57,19 +55,18 @@ def load_scp_static_solution(suppress_plots: bool = True):
     except ModuleNotFoundError as exc:
         msg = (
             f"Missing dependency '{exc.name}' required by {scp_path.name}. "
-            "Install SCP_static.py dependencies (e.g., cvxpy and a supported solver) and rerun."
+            "Install SCP_static_EKF.py dependencies (e.g., cvxpy and a supported solver) and rerun."
         )
         raise RuntimeError(msg) from exc
     finally:
         plt.show = original_show
 
     required = [
-        "x_nom",
-        "u_nom",
+        "x_hist",
+        "u_hist",
         "dt",
-        "N",
         "x0",
-        "p_target",
+        "p_target_true",
         "P_OBS",
         "R_OBS",
         "THETA",
@@ -79,24 +76,22 @@ def load_scp_static_solution(suppress_plots: bool = True):
     ]
     missing = [k for k in required if k not in data]
     if missing:
-        raise RuntimeError(f"SCP_static.py did not expose expected outputs: {missing}")
+        raise RuntimeError(f"SCP_static_EKF.py did not expose expected outputs: {missing}")
 
-    x_traj = np.asarray(data["x_nom"], dtype=float)
-    u_traj = np.asarray(data["u_nom"], dtype=float)
+    x_exec = np.asarray(data["x_hist"], dtype=float)
+    u_exec = np.asarray(data["u_hist"], dtype=float)
 
-    if x_traj.ndim != 2 or x_traj.shape[1] != 6:
-        raise RuntimeError(f"Unexpected x_nom shape {x_traj.shape}; expected (N, 6).")
-    if u_traj.shape != (x_traj.shape[0] - 1, 3):
-        raise RuntimeError(
-            f"Unexpected u_nom shape {u_traj.shape}; expected {(x_traj.shape[0] - 1, 3)}."
-        )
+    if x_exec.ndim != 2 or x_exec.shape[1] != 6:
+        raise RuntimeError(f"Unexpected x_hist shape {x_exec.shape}; expected (M, 6).")
+    if u_exec.ndim != 2 or u_exec.shape[1] != 3:
+        raise RuntimeError(f"Unexpected u_hist shape {u_exec.shape}; expected (K, 3).")
 
     return {
-        "x_traj": x_traj,
-        "u_traj": u_traj,
+        "x_exec": x_exec,
+        "u_exec": u_exec,
         "dt": float(data["dt"]),
         "x0": np.asarray(data["x0"], dtype=float),
-        "p_target": np.asarray(data["p_target"], dtype=float),
+        "target_pos": np.asarray(data["p_target_true"], dtype=float),
         "p_obs": np.asarray(data["P_OBS"], dtype=float),
         "r_obs": float(data["R_OBS"]),
         "cone_half_angle_rad": float(data["THETA"]),
@@ -106,13 +101,13 @@ def load_scp_static_solution(suppress_plots: bool = True):
     }
 
 
-def draw_trajectory(traj_xyz: np.ndarray, client: int):
+def draw_trajectory(traj_xyz: np.ndarray, client: int, color=(0.1, 0.4, 1.0), width=2.0):
     for i in range(traj_xyz.shape[0] - 1):
         p.addUserDebugLine(
             traj_xyz[i],
             traj_xyz[i + 1],
-            lineColorRGB=[0.1, 0.4, 1.0],
-            lineWidth=2.0,
+            lineColorRGB=list(color),
+            lineWidth=width,
             physicsClientId=client,
         )
 
@@ -195,10 +190,6 @@ def freeze_target_drone(env: CtrlAviary, target_pos: np.ndarray):
 
 
 def disable_collision_between_drones(env: CtrlAviary, chaser_idx: int = 0, target_idx: int = 1):
-    """Disable collisions between chaser and static target bodies.
-
-    This avoids physical contact locking the chaser above the target center.
-    """
     body_a = env.DRONE_IDS[chaser_idx]
     body_b = env.DRONE_IDS[target_idx]
     joints_a = [-1] + list(range(p.getNumJoints(body_a, physicsClientId=env.CLIENT)))
@@ -215,8 +206,24 @@ def disable_collision_between_drones(env: CtrlAviary, chaser_idx: int = 0, targe
             )
 
 
-def sample_control_zoh(u_traj: np.ndarray, t: float, dt_scp: float) -> np.ndarray:
-    idx = int(np.floor(max(t, 0.0) / dt_scp))
+def sample_state_linear(x_traj: np.ndarray, t: float, dt_plan: float) -> np.ndarray:
+    if x_traj.shape[0] == 1:
+        return x_traj[0].copy()
+
+    max_t = (x_traj.shape[0] - 1) * dt_plan
+    tau = float(np.clip(t, 0.0, max_t))
+    idx0 = int(np.floor(tau / dt_plan))
+    idx1 = min(idx0 + 1, x_traj.shape[0] - 1)
+
+    if idx1 == idx0:
+        return x_traj[idx0].copy()
+
+    alpha = (tau - idx0 * dt_plan) / dt_plan
+    return (1.0 - alpha) * x_traj[idx0] + alpha * x_traj[idx1]
+
+
+def sample_control_zoh(u_traj: np.ndarray, t: float, dt_plan: float) -> np.ndarray:
+    idx = int(np.floor(max(t, 0.0) / dt_plan))
     idx = min(max(idx, 0), u_traj.shape[0] - 1)
     return u_traj[idx].copy()
 
@@ -311,15 +318,18 @@ def run(
     disable_inter_drone_collision: bool = True,
     show_scp_plots: bool = False,
 ):
-    scp = load_scp_static_solution(suppress_plots=not show_scp_plots)
-    x_traj = scp["x_traj"]
-    u_traj = scp["u_traj"]
+    scp = load_scp_static_ekf_solution(suppress_plots=not show_scp_plots)
+    x_exec = scp["x_exec"]
+    u_exec = scp["u_exec"]
+
+    if u_exec.shape[0] < 1:
+        raise RuntimeError("SCP_static_EKF.py produced no control sequence (u_hist is empty).")
     if sim_freq_hz % control_freq_hz != 0:
         raise RuntimeError("sim_freq_hz must be an integer multiple of control_freq_hz.")
 
-    dt_scp = scp["dt"]
+    dt_plan = scp["dt"]
     chaser_init = scp["x0"][0:3]
-    target_pos = scp["p_target"].copy()
+    target_pos = scp["target_pos"].copy()
 
     env = CtrlAviary(
         drone_model=DroneModel.CF2X,
@@ -349,7 +359,7 @@ def run(
         length=1.2,
         client=pyb_client,
     )
-    draw_trajectory(x_traj[:, 0:3], pyb_client)
+    draw_trajectory(x_exec[:, 0:3], pyb_client, color=(0.1, 0.4, 1.0), width=2.0)
 
     chaser_hull = add_visual_sphere(chaser_init, scp["r_c"], [0.0, 1.0, 1.0, 0.30], pyb_client)
     target_hull = add_visual_sphere(target_pos, scp["r_t"], [1.0, 0.0, 1.0, 0.30], pyb_client)
@@ -364,29 +374,30 @@ def run(
     if freeze_target:
         freeze_target_drone(env, target_pos)
 
-    duration_scp = u_traj.shape[0] * dt_scp
-    base_duration = duration_scp + max(hold_sec, 0.0)
-    max_steps = int(np.ceil(base_duration * env.CTRL_FREQ))
+    duration_cmd = u_exec.shape[0] * dt_plan
+    total_duration = duration_cmd + max(hold_sec, 0.0)
+    max_steps = int(np.ceil(total_duration * env.CTRL_FREQ))
 
     print(
-        "[INFO] SCP horizon: "
-        f"{duration_scp:.2f}s, "
-        f"base sim duration: {base_duration:.2f}s"
+        "[INFO] Loaded SCP_static_EKF replay: "
+        f"{u_exec.shape[0]} controls @ dt={dt_plan:.3f}s, "
+        f"command horizon={duration_cmd:.2f}s, total duration={total_duration:.2f}s"
     )
+
+    pos_track_err = []
+    vel_track_err = []
 
     start_wall = time.time()
     i = 0
-
     while i < max_steps:
         if freeze_target:
             freeze_target_drone(env, target_pos)
 
         chaser = obs[0]
         sim_t = i * env.CTRL_TIMESTEP
-        if sim_t < duration_scp:
-            accel_cmd = sample_control_zoh(u_traj, sim_t, dt_scp)
+        if sim_t < duration_cmd:
+            accel_cmd = sample_control_zoh(u_exec, sim_t, dt_plan)
         else:
-            # After the SCP horizon, command zero translational acceleration.
             accel_cmd = np.zeros(3)
 
         accel_cmd = np.clip(accel_cmd, -SCP_ACCEL_CLIP, SCP_ACCEL_CLIP)
@@ -398,22 +409,28 @@ def run(
         if freeze_target:
             freeze_target_drone(env, target_pos)
 
-        update_visual_sphere(chaser_hull, obs[0][0:3], pyb_client)
+        chaser_pos = obs[0][0:3]
+        chaser_vel = obs[0][10:13]
+        update_visual_sphere(chaser_hull, chaser_pos, pyb_client)
         update_visual_sphere(target_hull, target_pos, pyb_client)
 
-        env.render()
-        if gui:
-            sync(i, start_wall, env.CTRL_TIMESTEP)
+        x_ref = sample_state_linear(x_exec, sim_t, dt_plan)
+        pos_track_err.append(float(np.linalg.norm(chaser_pos - x_ref[0:3])))
+        vel_track_err.append(float(np.linalg.norm(chaser_vel - x_ref[3:6])))
 
+        if gui:
+            env.render()
+            sync(i, start_wall, env.CTRL_TIMESTEP)
         i += 1
 
-    if obs is not None:
-        rel_pos = obs[0][0:3] - target_pos
-        rel_vel = obs[0][10:13]
-        print(f"[RESULT] Simulated time (s): {i * env.CTRL_TIMESTEP:.2f}")
-        print(f"[RESULT] Final relative position (m): {rel_pos}")
-        print(f"[RESULT] Final relative velocity (m/s): {rel_vel}")
-        print(f"[RESULT] Final docking distance (m): {np.linalg.norm(rel_pos):.4f}")
+    rel_pos = obs[0][0:3] - target_pos
+    rel_vel = obs[0][10:13]
+    print(f"[RESULT] Simulated time (s): {i * env.CTRL_TIMESTEP:.2f}")
+    print(f"[RESULT] Final relative position (m): {rel_pos}")
+    print(f"[RESULT] Final relative velocity (m/s): {rel_vel}")
+    print(f"[RESULT] Final docking distance (m): {np.linalg.norm(rel_pos):.4f}")
+    print(f"[RESULT] Mean position tracking error vs SCP replay (m): {np.mean(pos_track_err):.4f}")
+    print(f"[RESULT] Mean velocity tracking error vs SCP replay (m/s): {np.mean(vel_track_err):.4f}")
 
     env.close()
 
@@ -421,8 +438,8 @@ def run(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "Animate static-target docking by using x_nom/u_nom directly from theory/SCP_static.py "
-            "and mapping desired inertial accelerations to motor RPMs with rigid-body dynamics."
+            "Animate SCP_static_EKF.py by replaying its online-updated control history u_hist "
+            "without translational PD; only attitude control is used in accel-to-RPM mapping."
         )
     )
     parser.add_argument("--gui", default=True, type=str2bool, help="Use PyBullet GUI")
@@ -437,30 +454,30 @@ if __name__ == "__main__":
         "--control_freq_hz",
         default=DEFAULT_CONTROL_FREQ_HZ,
         type=int,
-        help="Control loop frequency for replaying SCP commands",
+        help="Control loop frequency for replaying SCP controls",
     )
     parser.add_argument(
         "--hold_sec",
         default=DEFAULT_HOLD_SEC,
         type=float,
-        help="Additional time to continue with zero translational acceleration after SCP horizon",
+        help="Extra time after control horizon with zero translational acceleration",
     )
     parser.add_argument(
         "--freeze_target",
         default=True,
         type=str2bool,
-        help="Keep target drone fixed at target position (no target dynamics)",
+        help="Keep static target fixed at true position",
     )
     parser.add_argument(
         "--disable_inter_drone_collision",
         default=True,
         type=str2bool,
-        help="Disable collisions between chaser and static target to allow center docking",
+        help="Disable collisions between chaser and target",
     )
     parser.add_argument(
         "--show_scp_plots",
         default=False,
         type=str2bool,
-        help="Allow SCP_static.py plots to display instead of suppressing them",
+        help="Allow SCP_static_EKF.py plots to display instead of suppressing them",
     )
     run(**vars(parser.parse_args()))
