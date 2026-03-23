@@ -1,6 +1,10 @@
 import numpy as np
 import cvxpy as cp
 import matplotlib.pyplot as plt
+try:
+    from scp_diagnostic_plots import plot_scp_diagnostics
+except ModuleNotFoundError:
+    from gym_pybullet_drones.theory.scp_diagnostic_plots import plot_scp_diagnostics
 
 SCP_SOLVER_ORDER = ("ECOS", "CLARABEL", "SCS")
 ACCEPTABLE_SOLVER_STATUSES = {"optimal", "optimal_inaccurate"}
@@ -204,6 +208,19 @@ phase_hist = []
 cost_history = []
 delta_history = []
 trust_history = []
+virtual_norm_history = []
+
+iter_cost_history = []
+iter_trust_history = []
+iter_virtual_norm_history = []
+
+pos_ref_hist = []
+vel_ref_hist = []
+pos_err_hist = []
+vel_err_hist = []
+
+obstacle_residual_history = []
+cone_residual_history = []
 
 tar_hist = [x_tar_true.copy()]
 tar_est_hist = [ekf.x[0:6].copy()]
@@ -260,12 +277,14 @@ for sim_step in range(SIM_MAX_STEPS):
     last_prob_value = np.nan
     last_delta = np.nan
     last_solver = "none"
+    last_virtual_norm = np.nan
 
     # 4) Inner SCP loop (state only)
     for it in range(MAX_ITERS):
         X = cp.Variable((N, 6))
         slack_cone = cp.Variable(N - 1, nonneg=True)
         slack_tar = cp.Variable(N - 1, nonneg=True)
+        nu = cp.Variable((N - 1, 3))
 
         cost = 0
         con = [X[0, :] == x_rel_true]
@@ -277,7 +296,10 @@ for sim_step in range(SIM_MAX_STEPS):
 
         for k in range(N - 1):
             # Kinematic dynamics without explicit control variable
-            con += [X[k + 1, 0:3] == X[k, 0:3] + 0.5 * dt * (X[k, 3:6] + X[k + 1, 3:6])]
+            con += [
+                X[k + 1, 0:3]
+                == X[k, 0:3] + 0.5 * dt * (X[k, 3:6] + X[k + 1, 3:6]) + nu[k, :]
+            ]
 
             acc_k = (X[k + 1, 3:6] - X[k, 3:6]) / dt
 
@@ -287,6 +309,7 @@ for sim_step in range(SIM_MAX_STEPS):
             cost += cp.sum_squares(X[k, 3:6]) * 1.2
             cost += cp.sum_squares(acc_k) * 0.4
             cost += cp.sum_squares(X[k, :] - X_nom[k, :]) * 0.4
+            cost += cp.sum_squares(nu[k, :]) * 1e5
 
             # Trust region and physical limits
             con += [cp.norm(X[k, :] - X_nom[k, :], np.inf) <= trust_radius]
@@ -329,6 +352,13 @@ for sim_step in range(SIM_MAX_STEPS):
         last_prob_value = float(prob.value) if prob.value is not None else np.nan
         delta = np.linalg.norm(X.value - X_nom, np.inf)
         last_delta = float(delta)
+        last_virtual_norm = (
+            float(np.linalg.norm(nu.value, ord="fro")) if nu.value is not None else np.nan
+        )
+
+        iter_cost_history.append(last_prob_value)
+        iter_trust_history.append(trust_radius)
+        iter_virtual_norm_history.append(last_virtual_norm)
 
         X_nom = X.value.copy()
 
@@ -368,6 +398,19 @@ for sim_step in range(SIM_MAX_STEPS):
     cost_history.append(last_prob_value)
     delta_history.append(last_delta)
     trust_history.append(trust_radius)
+    virtual_norm_history.append(last_virtual_norm)
+
+    pos_ref_hist.append(pos_ref_abs.copy())
+    vel_ref_hist.append(vel_ref_abs.copy())
+    pos_err_hist.append(pos_err.copy())
+    vel_err_hist.append(vel_err.copy())
+
+    p_rel_exec = x_true[0:3] - x_tar_true[0:3]
+    obs_res = np.linalg.norm(x_true[0:3] - P_OBS) - (R_OBS + R_SAFE)
+    cone_res = (-N_APP @ p_rel_exec) - np.linalg.norm(p_rel_exec) * np.cos(THETA)
+    obstacle_residual_history.append(obs_res)
+    cone_residual_history.append(cone_res)
+
     tar_hist.append(x_tar_true.copy())
     tar_est_hist.append(x_tar_est.copy())
 
@@ -382,48 +425,34 @@ for sim_step in range(SIM_MAX_STEPS):
 # ================= PLOTTING =================
 x_hist = np.array(x_hist)
 u_hist = np.array(u_hist)
-x_star_hist = np.array(x_star_hist)
 phase_hist = np.array(phase_hist)
 tar_hist = np.array(tar_hist)
-tar_est_hist = np.array(tar_est_hist)
-ctrl_steps = np.arange(u_hist.shape[0]) * dt
 
-plt.style.use("seaborn-v0_8-darkgrid")
-fig1 = plt.figure(figsize=(14, 6))
-
-ax1 = fig1.add_subplot(121, projection="3d")
-ax1.plot(x_hist[:, 0], x_hist[:, 1], x_hist[:, 2], "b.-", linewidth=2, label="Chaser (PID)")
-ax1.plot(tar_hist[:, 0], tar_hist[:, 1], tar_hist[:, 2], "r-", linewidth=2, label="True Target")
-ax1.plot(tar_est_hist[:, 0], tar_est_hist[:, 1], tar_est_hist[:, 2], "y--", alpha=0.7, label="EKF Estimate")
-
-u_sph, v_sph = np.mgrid[0 : 2 * np.pi : 20j, 0 : np.pi : 10j]
-x_sph = P_OBS[0] + R_OBS * np.cos(u_sph) * np.sin(v_sph)
-y_sph = P_OBS[1] + R_OBS * np.sin(u_sph) * np.sin(v_sph)
-z_sph = P_OBS[2] + R_OBS * np.cos(v_sph)
-ax1.plot_surface(x_sph, y_sph, z_sph, color="r", alpha=0.3)
-ax1.set_title("Linear EKF: x_star SCP + PID Motion")
-ax1.legend()
-
-ax2 = fig1.add_subplot(122)
-rel_dist = np.linalg.norm(x_hist[:, 0:3] - tar_hist[:, 0:3], axis=1)
-rel_vel = np.linalg.norm(x_hist[:, 3:6] - tar_hist[:, 3:6], axis=1)
-ax2.plot(np.arange(rel_dist.shape[0]) * dt, rel_dist, "m-", linewidth=2, label="Relative Position Error")
-ax2.plot(np.arange(rel_vel.shape[0]) * dt, rel_vel, "c-", linewidth=2, label="Relative Velocity Error")
-ax2.axhline(0.3, color="k", linestyle="--", alpha=0.5, label="FSM Trigger Radius")
-ax2.fill_between(
-    ctrl_steps,
-    0,
-    max(rel_dist[:-1]) if rel_dist.shape[0] > 1 else 1.0,
-    where=(phase_hist == 1),
-    color="cyan",
-    alpha=0.1,
-    transform=ax2.get_xaxis_transform(),
-    label="Phase 1 Active",
+plot_scp_diagnostics(
+    title_prefix="Linear EKF + x_star PID",
+    dt=dt,
+    x_hist=x_hist,
+    u_hist=u_hist,
+    phase_hist=phase_hist,
+    target_pos_hist=tar_hist[:, 0:3],
+    target_vel_hist=tar_hist[:, 3:6],
+    obstacle_pos=P_OBS,
+    r_obs=R_OBS,
+    r_safe=R_SAFE,
+    theta=THETA,
+    n_app=N_APP,
+    v_max=V_MAX,
+    pos_ref_hist=np.array(pos_ref_hist),
+    vel_ref_hist=np.array(vel_ref_hist),
+    pos_err_hist=np.array(pos_err_hist),
+    vel_err_hist=np.array(vel_err_hist),
+    trust_history=np.array(trust_history),
+    cost_history=np.array(cost_history),
+    delta_history=np.array(delta_history),
+    virtual_norm_history=np.array(virtual_norm_history),
+    iter_cost_history=np.array(iter_cost_history),
+    iter_trust_history=np.array(iter_trust_history),
+    iter_virtual_norm_history=np.array(iter_virtual_norm_history),
+    obstacle_residual_history=np.array(obstacle_residual_history),
+    cone_residual_history=np.array(cone_residual_history),
 )
-ax2.set_xlabel("Time (s)")
-ax2.set_ylabel("Error Magnitude")
-ax2.set_title("Soft-Docking Convergence")
-ax2.legend()
-
-plt.tight_layout()
-plt.show()

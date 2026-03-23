@@ -1,6 +1,10 @@
 import numpy as np
 import cvxpy as cp
 import matplotlib.pyplot as plt
+try:
+    from scp_diagnostic_plots import plot_scp_diagnostics
+except ModuleNotFoundError:
+    from gym_pybullet_drones.theory.scp_diagnostic_plots import plot_scp_diagnostics
 
 # ================= SYSTEM =================
 dt = 0.1
@@ -91,13 +95,31 @@ u_nom[:, 2] = GRAVITY
 
 SIM_MAX_STEPS = 80
 TOL = 1e-3
-MAX_ITERS = 5
+MAX_ITERS = 10
 
 x_hist = [x0.copy()]
 u_hist = []
 cost_history = []
 phase_hist = []
 time_steps_hist = [0.0]
+delta_history = []
+trust_history = []
+virtual_norm_history = []
+
+iter_cost_history = []
+iter_trust_history = []
+iter_virtual_norm_history = []
+
+pos_ref_hist = []
+vel_ref_hist = []
+pos_err_hist = []
+vel_err_hist = []
+
+obstacle_residual_history = []
+cone_residual_history = []
+
+target_pos_hist = [p_target_true.copy()]
+target_vel_hist = [np.zeros(3)]
 
 x_true = x0.copy()
 phase = 0 
@@ -132,6 +154,9 @@ for sim_step in range(SIM_MAX_STEPS):
         
     trust_radius = 2.0
     scp_converged = False
+    last_prob_value = np.nan
+    last_delta = np.nan
+    last_virtual_norm = np.nan
     
     # 4. Successive Convexification Loop
    # 4. Successive Convexification Loop
@@ -221,6 +246,16 @@ for sim_step in range(SIM_MAX_STEPS):
             continue
             
         delta = np.linalg.norm(X.value - X_nom, np.inf)
+        last_prob_value = float(prob.value) if prob.value is not None else np.nan
+        last_delta = float(delta)
+        last_virtual_norm = (
+            float(np.linalg.norm(nu.value, ord="fro")) if nu.value is not None else np.nan
+        )
+
+        iter_cost_history.append(last_prob_value)
+        iter_trust_history.append(trust_radius)
+        iter_virtual_norm_history.append(last_virtual_norm)
+
         X_nom = X.value.copy()
         u_nom = u.value.copy() 
         
@@ -229,9 +264,20 @@ for sim_step in range(SIM_MAX_STEPS):
             break
         trust_radius = np.clip(1.1 * trust_radius, 0.1, 3.0)
 
-    print(f"Step {sim_step:02d} | Phase: {phase} | Cost: {prob.value:.1f} | Iters: {it+1}")
+    cost_str = f"{last_prob_value:.1f}" if np.isfinite(last_prob_value) else "nan"
+    print(
+        f"Step {sim_step:02d} | Phase: {phase} | Cost: {cost_str} | "
+        f"Iters: {it+1} | SCP Converged: {scp_converged}"
+    )
 
     # 5. Integrate True Non-Linear Dynamics
+    x_now = x_true.copy()
+    x_ref = X_nom[min(1, N - 1), :]
+    pos_ref = x_ref[0:3]
+    vel_ref = x_ref[3:6]
+    pos_err = pos_ref - x_now[0:3]
+    vel_err = vel_ref - x_now[3:6]
+
     u_opt = u_nom[0, :]
     
     # We use micro-stepping for accurate continuous simulation of the drone body
@@ -242,83 +288,61 @@ for sim_step in range(SIM_MAX_STEPS):
     x_hist.append(x_true.copy())
     u_hist.append(u_opt.copy())
     phase_hist.append(phase)
-    cost_history.append(prob.value if prob.value else 0)
+    cost_history.append(last_prob_value)
+    delta_history.append(last_delta)
+    trust_history.append(trust_radius)
+    virtual_norm_history.append(last_virtual_norm)
+
+    pos_ref_hist.append(pos_ref.copy())
+    vel_ref_hist.append(vel_ref.copy())
+    pos_err_hist.append(pos_err.copy())
+    vel_err_hist.append(vel_err.copy())
+
+    p_rel_exec = x_true[0:3] - p_target_true
+    obs_res = np.linalg.norm(x_true[0:3] - P_OBS) - (R_OBS + R_SAFE)
+    cone_res = (-N_APP @ p_rel_exec) - np.linalg.norm(p_rel_exec) * np.cos(THETA)
+    obstacle_residual_history.append(obs_res)
+    cone_residual_history.append(cone_res)
+
+    target_pos_hist.append(p_target_true.copy())
+    target_vel_hist.append(np.zeros(3))
     time_steps_hist.append((sim_step + 1) * dt)
 
-# ================= PLOTTING (Exact match to SCP_static_EKF.py) =================
+# ================= PLOTTING =================
 x_hist = np.array(x_hist)
 u_hist = np.array(u_hist)
 phase_hist = np.array(phase_hist)
-time_steps_hist = np.array(time_steps_hist)
-
-plt.style.use('seaborn-v0_8-darkgrid')
-
-# ----------------- FIGURE 1: 3D Trajectory & FSM -----------------
-fig1 = plt.figure(figsize=(12, 5))
-ax1 = fig1.add_subplot(121, projection='3d')
-
-traj = x_hist[:, 0:3]
-ax1.plot(traj[:,0], traj[:,1], traj[:,2], 'b.-', linewidth=3, label='NMPC Executed Traj')
-ax1.plot(x0[0], x0[1], x0[2], 'go', markersize=8, label='Start')
-ax1.plot(p_target_true[0], p_target_true[1], p_target_true[2], 'r*', markersize=12, label='True Target')
-
-u_sph, v_sph = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
-x_sph = P_OBS[0] + R_OBS*np.cos(u_sph)*np.sin(v_sph)
-y_sph = P_OBS[1] + R_OBS*np.sin(u_sph)*np.sin(v_sph)
-z_sph = P_OBS[2] + R_OBS*np.cos(v_sph)
-ax1.plot_surface(x_sph, y_sph, z_sph, color='r', alpha=0.3)
-
-ax1.set_title('Online NMPC Trajectory (9D Drone Dynamics)')
-ax1.legend()
-
-ax2 = fig1.add_subplot(122)
-ctrl_steps_hist = time_steps_hist[:-1]
-dist_array = np.linalg.norm(x_hist[:-1, 0:3] - p_target_true, axis=1)
-
-ax2.plot(ctrl_steps_hist, dist_array, 'm-', linewidth=2, label='Relative Distance')
-ax2.axhline(0.3, color='k', linestyle='--', label='FSM Trigger Threshold')
-ax2.fill_between(ctrl_steps_hist, 0, max(dist_array), where=(phase_hist==1), color='cyan', alpha=0.2, transform=ax2.get_xaxis_transform(), label='Phase 1 Active (Cone)')
-
-ax2.set_xlabel('Time (s)')
-ax2.set_ylabel('Distance to Target (m)')
-ax2.set_title('FSM Phase Tracking')
-ax2.legend()
-
-# ----------------- FIGURE 2: Safety Constraints -----------------
-fig3, (ax_obs, ax_cone) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-
-dist_obs = np.linalg.norm(traj - P_OBS, axis=1)
-ax_obs.plot(time_steps_hist, dist_obs, 'r', linewidth=2)
-ax_obs.axhline(R_OBS + R_SAFE, color='k', linestyle='--', label=f'Minimum Safe Distance ({R_OBS + R_SAFE}m)')
-ax_obs.fill_between(time_steps_hist, 0, R_OBS + R_SAFE, color='red', alpha=0.1)
-ax_obs.set_ylabel('Distance to Obstacle Center (m)')
-ax_obs.set_title('Obstacle Avoidance Clearance')
-ax_obs.legend()
-
-angles = []
-for p in x_hist[:, 0:3]:
-    p_rel = p - p_target_true
-    dist = np.linalg.norm(p_rel)
-    if dist < 1e-5:
-        angles.append(0.0)
-    else:
-        cos_phi = np.clip(np.dot(-N_APP, p_rel) / dist, -1.0, 1.0)
-        angles.append(np.degrees(np.arccos(cos_phi)))
-
-ax_cone.plot(time_steps_hist, angles, 'c', linewidth=2)
-ax_cone.axhline(np.degrees(THETA), color='k', linestyle='--', label=f'Cone Limit ({np.degrees(THETA)}°)')
-ax_cone.fill_between(time_steps_hist, 0, np.degrees(THETA), color='cyan', alpha=0.1)
-ax_cone.set_ylabel('Approach Angle (deg)')
-ax_cone.set_xlabel('Time (s)')
-ax_cone.set_title('Executed Docking Cone Alignment')
-ax_cone.legend()
-
-plt.tight_layout()
 
 # Save the trajectory for MuJoCo to track blindly
 np.save("x_ref.npy", x_hist)
 np.save("u_ref.npy", u_hist)
 print("Trajectory saved to x_ref.npy and u_ref.npy! Ready for MuJoCo.")
 
-
-plt.show()
+plot_scp_diagnostics(
+    title_prefix="Static Drone-Dynamics SCP",
+    dt=dt,
+    x_hist=x_hist,
+    u_hist=u_hist,
+    phase_hist=phase_hist,
+    target_pos_hist=np.array(target_pos_hist),
+    target_vel_hist=np.array(target_vel_hist),
+    obstacle_pos=P_OBS,
+    r_obs=R_OBS,
+    r_safe=R_SAFE,
+    theta=THETA,
+    n_app=N_APP,
+    v_max=V_MAX,
+    pos_ref_hist=np.array(pos_ref_hist),
+    vel_ref_hist=np.array(vel_ref_hist),
+    pos_err_hist=np.array(pos_err_hist),
+    vel_err_hist=np.array(vel_err_hist),
+    trust_history=np.array(trust_history),
+    cost_history=np.array(cost_history),
+    delta_history=np.array(delta_history),
+    virtual_norm_history=np.array(virtual_norm_history),
+    iter_cost_history=np.array(iter_cost_history),
+    iter_trust_history=np.array(iter_trust_history),
+    iter_virtual_norm_history=np.array(iter_virtual_norm_history),
+    obstacle_residual_history=np.array(obstacle_residual_history),
+    cone_residual_history=np.array(cone_residual_history),
+)
