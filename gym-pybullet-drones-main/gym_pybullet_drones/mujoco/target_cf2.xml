@@ -1,0 +1,157 @@
+<mujoco model="target_cf2">
+  <option integrator="RK4" density="1.225" viscosity="1.8e-5"/>
+
+  <compiler inertiafromgeom="false" meshdir="assets" autolimits="true"/>
+
+  <!-- ================= DEFAULTS (RENAMED) ================= -->
+  <default>
+    <default class="target_cf2">
+      <default class="target_visual">
+        <geom group="2" type="mesh" contype="0" conaffinity="0"/>
+      </default>
+      <default class="target_collision">
+        <geom group="3" type="mesh"/>
+      </default>
+      <site group="5"/>
+    </default>
+  </default>
+
+  <!-- ================= ASSETS (RENAMED) ================= -->
+  <asset>
+    <material name="target_polished_plastic" rgba="0.631 0.659 0.678 1"/>
+    <material name="target_polished_gold" rgba="0.969 0.878 0.6 1"/>
+    <material name="target_medium_gloss_plastic" rgba="0.109 0.184 0.0 1"/>
+    <material name="target_propeller_plastic" rgba="0.792 0.820 0.933 1"/>
+    <material name="target_white" rgba="1 1 1 1"/>
+    <material name="target_body_frame_plastic" rgba="0.102 0.102 0.102 1"/>
+    <material name="target_burnished_chrome" rgba="0.898 0.898 0.898 1"/>
+
+    <!-- MESHES (must be renamed too) -->
+    <mesh name="target_cf2_0" file="cf2_0.obj"/>
+    <mesh name="target_cf2_1" file="cf2_1.obj"/>
+    <mesh name="target_cf2_2" file="cf2_2.obj"/>
+    <mesh name="target_cf2_3" file="cf2_3.obj"/>
+    <mesh name="target_cf2_4" file="cf2_4.obj"/>
+    <mesh name="target_cf2_5" file="cf2_5.obj"/>
+    <mesh name="target_cf2_6" file="cf2_6.obj"/>
+
+    <!-- collision meshes -->
+    <mesh name="target_cf2_collision_0" file="cf2_collision_0.obj"/>
+    <mesh name="target_cf2_collision_1" file="cf2_collision_1.obj"/>
+    <mesh name="target_cf2_collision_2" file="cf2_collision_2.obj"/>
+    <mesh name="target_cf2_collision_3" file="cf2_collision_3.obj"/>
+    <mesh name="target_cf2_collision_4" file="cf2_collision_4.obj"/>
+    <mesh name="target_cf2_collision_5" file="cf2_collision_5.obj"/>
+    <mesh name="target_cf2_collision_6" file="cf2_collision_6.obj"/>
+    <mesh name="target_cf2_collision_7" file="cf2_collision_7.obj"/>
+    <mesh name="target_cf2_collision_8" file="cf2_collision_8.obj"/>
+    <mesh name="target_cf2_collision_9" file="cf2_collision_9.obj"/>
+    <mesh name="target_cf2_collision_10" file="cf2_collision_10.obj"/>
+    <mesh name="target_cf2_collision_11" file="cf2_collision_11.obj"/>
+    <mesh name="target_cf2_collision_12" file="cf2_collision_12.obj"/>
+    <mesh name="target_cf2_collision_13" file="cf2_collision_13.obj"/>
+    <mesh name="target_cf2_collision_14" file="cf2_collision_14.obj"/>
+    <mesh name="target_cf2_collision_15" file="cf2_collision_15.obj"/>
+    <mesh name="target_cf2_collision_16" file="cf2_collision_16.obj"/>
+    <mesh name="target_cf2_collision_17" file="cf2_collision_17.obj"/>
+    <mesh name="target_cf2_collision_18" file="cf2_collision_18.obj"/>
+    <mesh name="target_cf2_collision_19" file="cf2_collision_19.obj"/>
+    <mesh name="target_cf2_collision_20" file="cf2_collision_20.obj"/>
+    <mesh name="target_cf2_collision_21" file="cf2_collision_21.obj"/>
+    <mesh name="target_cf2_collision_22" file="cf2_collision_22.obj"/>
+    <mesh name="target_cf2_collision_23" file="cf2_collision_23.obj"/>
+    <mesh name="target_cf2_collision_24" file="cf2_collision_24.obj"/>
+    <mesh name="target_cf2_collision_25" file="cf2_collision_25.obj"/>
+    <mesh name="target_cf2_collision_26" file="cf2_collision_26.obj"/>
+    <mesh name="target_cf2_collision_27" file="cf2_collision_27.obj"/>
+    <mesh name="target_cf2_collision_28" file="cf2_collision_28.obj"/>
+    <mesh name="target_cf2_collision_29" file="cf2_collision_29.obj"/>
+    <mesh name="target_cf2_collision_30" file="cf2_collision_30.obj"/>
+    <mesh name="target_cf2_collision_31" file="cf2_collision_31.obj"/>
+  </asset>
+
+  <!-- ================= BODY ================= -->
+  <worldbody>
+    <body name="target_cf2" mocap="true" pos="1 0 1" childclass="target_cf2">
+
+      <geom type="sphere" size="0.1" rgba="0 0 1 0.2" contype="0" conaffinity="0"/>
+      <!-- <freejoint/> -->
+      <inertial pos="0 0 0" mass="0.027"
+        diaginertia="2.3951e-5 2.3951e-5 3.2347e-5"/>
+
+      <camera name="target_track" pos="-1 0 .5"
+        xyaxes="0 -1 0 1 0 2" mode="trackcom"/>
+
+      <!-- visual -->
+      <geom mesh="target_cf2_0" material="target_propeller_plastic" class="target_visual"/>
+      <geom mesh="target_cf2_1" material="target_medium_gloss_plastic" class="target_visual"/>
+      <geom mesh="target_cf2_2" material="target_polished_gold" class="target_visual"/>
+      <geom mesh="target_cf2_3" material="target_polished_plastic" class="target_visual"/>
+      <geom mesh="target_cf2_4" material="target_burnished_chrome" class="target_visual"/>
+      <geom mesh="target_cf2_5" material="target_body_frame_plastic" class="target_visual"/>
+      <geom mesh="target_cf2_6" material="target_white" class="target_visual"/>
+
+      <!-- collision -->
+      <geom mesh="target_cf2_collision_0" class="target_collision"/>
+      <geom mesh="target_cf2_collision_1" class="target_collision"/>
+      <geom mesh="target_cf2_collision_2" class="target_collision"/>
+      <geom mesh="target_cf2_collision_3" class="target_collision"/>
+      <geom mesh="target_cf2_collision_4" class="target_collision"/>
+      <geom mesh="target_cf2_collision_5" class="target_collision"/>
+      <geom mesh="target_cf2_collision_6" class="target_collision"/>
+      <geom mesh="target_cf2_collision_7" class="target_collision"/>
+      <geom mesh="target_cf2_collision_8" class="target_collision"/>
+      <geom mesh="target_cf2_collision_9" class="target_collision"/>
+      <geom mesh="target_cf2_collision_10" class="target_collision"/>
+      <geom mesh="target_cf2_collision_11" class="target_collision"/>
+      <geom mesh="target_cf2_collision_12" class="target_collision"/>
+      <geom mesh="target_cf2_collision_13" class="target_collision"/>
+      <geom mesh="target_cf2_collision_14" class="target_collision"/>
+      <geom mesh="target_cf2_collision_15" class="target_collision"/>
+      <geom mesh="target_cf2_collision_16" class="target_collision"/>
+      <geom mesh="target_cf2_collision_17" class="target_collision"/>
+      <geom mesh="target_cf2_collision_18" class="target_collision"/>
+      <geom mesh="target_cf2_collision_19" class="target_collision"/>
+      <geom mesh="target_cf2_collision_20" class="target_collision"/>
+      <geom mesh="target_cf2_collision_21" class="target_collision"/>
+      <geom mesh="target_cf2_collision_22" class="target_collision"/>
+      <geom mesh="target_cf2_collision_23" class="target_collision"/>
+      <geom mesh="target_cf2_collision_24" class="target_collision"/>
+      <geom mesh="target_cf2_collision_25" class="target_collision"/>
+      <geom mesh="target_cf2_collision_26" class="target_collision"/>
+      <geom mesh="target_cf2_collision_27" class="target_collision"/>
+      <geom mesh="target_cf2_collision_28" class="target_collision"/>
+      <geom mesh="target_cf2_collision_29" class="target_collision"/>
+      <geom mesh="target_cf2_collision_30" class="target_collision"/>
+      <geom mesh="target_cf2_collision_31" class="target_collision"/>
+
+      <site name="target_imu"/>
+      <site name="target_actuation"/>
+
+    </body>
+  </worldbody>
+
+  <!-- ================= ACTUATORS (RENAMED CLASS + SITE) ================= -->
+  <actuator>
+    <motor class="target_cf2" ctrlrange="0 0.35"
+      gear="0 0 1 0 0 0" site="target_actuation" name="target_body_thrust"/>
+
+    <motor class="target_cf2" ctrlrange="-1 1"
+      gear="0 0 0 -0.001 0 0" site="target_actuation" name="target_x_moment"/>
+
+    <motor class="target_cf2" ctrlrange="-1 1"
+      gear="0 0 0 0 -0.001 0" site="target_actuation" name="target_y_moment"/>
+
+    <motor class="target_cf2" ctrlrange="-1 1"
+      gear="0 0 0 0 0 -0.001" site="target_actuation" name="target_z_moment"/>
+  </actuator>
+
+  <!-- ================= SENSORS ================= -->
+  <sensor>
+    <gyro name="target_body_gyro" site="target_imu"/>
+    <accelerometer name="target_body_linacc" site="target_imu"/>
+    <framequat name="target_body_quat" objtype="site" objname="target_imu"/>
+  </sensor>
+
+
+</mujoco>
