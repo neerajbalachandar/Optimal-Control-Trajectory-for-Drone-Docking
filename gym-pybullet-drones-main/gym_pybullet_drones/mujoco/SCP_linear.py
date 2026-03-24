@@ -261,6 +261,8 @@ nmpc_planner = DroneNMPC(dt=NMPC_DT, N=15)
 # Initialization
 p_target_true = np.array([1.0, 0.0, 1.0])
 v_target_base = np.array([0.15, 0.1, 0.0]) 
+# v_target_base = np.array([0, 0, 0.0]) 
+
 
 x_tar_hat = np.zeros(6); x_tar_hat[0:3] = p_target_true.copy(); x_tar_hat[3:6] = v_target_base.copy()
 x_hat = np.zeros(9); x_hat[0:3] = np.array([-2.5, 0.0, 1.5])

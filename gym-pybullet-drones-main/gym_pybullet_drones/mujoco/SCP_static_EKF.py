@@ -92,7 +92,7 @@ class DroneNMPC:
             cost = 0
             con = [X[0, :] == x_true]
             # offset = np.array([0.0, 0.0, 0.5]) if phase == 0 else np.zeros(3)
-            offset = np.array([0.0, 0.0, 0.2]) if phase == 0 else np.array([0.0, 0.0, 0.2])
+            offset = np.array([0.0, 0.0, 0.3]) if phase == 0 else np.array([0.0, 0.0, 0.2])
             
             
             cost += cp.sum_squares(X[-1, 0:3] - (p_target + offset)) * 1000.0
@@ -346,6 +346,15 @@ def key_callback(keycode):
 
 with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
     
+    
+    # --- DOCKING TERMINATION CRITERIA ---
+    DOCK_DIST_TOL = 0.21     # meters (Max acceptable distance to be considered "docked")
+    DOCK_VEL_TOL = 0.15       # m/s (Max velocity, ensures the drone has actually stopped)
+    DOCK_STABILITY_TIME = 0.5 # seconds (Must hold position for this long to prove stability)
+    MAX_SIM_TIME = 30.0       # seconds (Failsafe timeout if it gets stuck)
+
+    stable_dock_timer = 0.0
+    
     while viewer.is_running():
         step_start = time.time()
         
@@ -409,7 +418,7 @@ with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as vie
                 # ====================================================
                 # FSM triggers based strictly on ESTIMATED positions
                 dist_xy = np.linalg.norm(x_hat[0:2] - p_tar_hat[0:2])
-                if current_phase == 0 and dist_xy < 0.2:
+                if current_phase == 0 and dist_xy < 0.15:
                     current_phase = 1
                     print(f"[{data.time:.1f}s] FSM TRIGGER: Phase 1 (Cone) Activated!")
 
@@ -445,6 +454,30 @@ with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as vie
                 
                 last_thrust_state = target_acc 
                 last_nmpc_time = data.time
+                print(f"t={data.time:.1f}s | Ph: {current_phase} | Est. Wind: [{x_hat[6]:.2f}, {x_hat[7]:.2f}] m/s²")
+
+                # =========================================================
+                # 🛑 DOCKING TERMINATION CHECK
+                # =========================================================
+                dist_3d = np.linalg.norm(x_hat[0:3] - x_tar_hat[0:3])
+                vel_norm = np.linalg.norm(x_hat[3:6])
+                
+                if current_phase == 1 and dist_3d < DOCK_DIST_TOL and vel_norm < DOCK_VEL_TOL:
+                    stable_dock_timer += NMPC_DT
+                    if stable_dock_timer >= DOCK_STABILITY_TIME:
+                        print(f"\n✅ DOCKING SUCCESSFUL!")
+                        print(f"⏱️ Time to Dock: {data.time:.2f} seconds.")
+                        print(f"📏 Final Error: {dist_3d:.3f} meters.")
+                        break  # This exits the MuJoCo loop and opens your plots!
+                else:
+                    stable_dock_timer = 0.0 # Reset if it drifts out of tolerance
+                    
+                if data.time >= MAX_SIM_TIME:
+                    print(f"\n❌ SIMULATION TIMEOUT: Reached {MAX_SIM_TIME}s without stable docking.")
+                    break
+                # =========================================================
+                
+                
                 
                 # Print the live wind estimate so you can watch it learn!
                 print(f"NMPC Updated at t={data.time:.2f}s | Phase: {current_phase} | Est. Wind: [{x_hat[6]:.2f}, {x_hat[7]:.2f}, {x_hat[8]:.2f}] m/s²")
@@ -625,7 +658,7 @@ ax_v.plot(time_steps, v_norms, 'purple', linewidth=2.5, label='$||v||_2$')
 ax_v.axhline(V_MAX, color='k', linestyle='--', linewidth=2, label='$V_{max}$ Constraint')
 ax_v.set_xlabel('Time (s)')
 ax_v.set_ylabel('Velocity Magnitude ($m/s$)')
-ax_v.legend(loc='upper right')
+ax_v.legend(loc='upper right', bbox_to_anchor=(1, 0.9))
 plt.tight_layout()
 fig3.savefig("ieee_plots/3_velocity_norm.png", dpi=300, bbox_inches='tight')
 
