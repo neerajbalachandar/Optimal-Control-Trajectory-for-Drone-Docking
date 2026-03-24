@@ -680,9 +680,9 @@ ax_r.plot(time_steps, dist_to_target, 'm-', linewidth=2.5, label='Relative Dista
 ax_r.axhline(0.1, color='k', linestyle='--', linewidth=1.5, label='Docking Tolerance (0.1m)')
 
 # Annotate convergence rate
-ax_r.annotate('Exponential Convergence', xy=(time_steps[len(time_steps)//2], dist_to_target[len(time_steps)//2]), 
-             xytext=(time_steps[len(time_steps)//3], dist_to_target[len(time_steps)//3] + 0.5),
-             arrowprops=dict(facecolor='black', arrowstyle='->'), fontsize=10)
+# ax_r.annotate('Exponential Convergence', xy=(time_steps[len(time_steps)//2], dist_to_target[len(time_steps)//2]), 
+#              xytext=(time_steps[len(time_steps)//3], dist_to_target[len(time_steps)//3] + 0.5),
+#              arrowprops=dict(facecolor='black', arrowstyle='->'), fontsize=10)
 
 ax_r.set_xlabel('Time (s)')
 ax_r.set_ylabel('Distance to Target (m)')

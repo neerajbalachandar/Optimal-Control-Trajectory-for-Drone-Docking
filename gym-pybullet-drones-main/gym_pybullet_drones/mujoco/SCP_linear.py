@@ -256,7 +256,7 @@ pd_roll  = PDController(kp=200.0, kd=50.0)
 pd_pitch = PDController(kp=200.0, kd=50.0)
 pd_yaw   = PDController(kp=100.0, kd=25.0)
 
-nmpc_planner = DroneNMPC(dt=NMPC_DT, N=25)
+nmpc_planner = DroneNMPC(dt=NMPC_DT, N=15)
 
 # Initialization
 p_target_true = np.array([1.0, 0.0, 1.0])
@@ -572,7 +572,7 @@ ax_cone.axhline(np.degrees(THETA), color='r', linestyle='--', linewidth=2, label
 ax_cone.axvline(dock_time, color='k', linestyle=':', linewidth=1.5, label='Docking Achieved')
 ax_cone.set_xlabel('Time (s)')
 ax_cone.set_ylabel('Approach angle $\\phi$ (deg)')
-ax_cone.legend()
+ax_cone.legend(loc='upper right')
 plt.tight_layout()
 fig6.savefig("ieee_plots/6_docking_cone_angle.png", dpi=300, bbox_inches='tight')
 
@@ -581,10 +581,10 @@ fig8 = plt.figure(figsize=SINGLE_COL)
 ax_r = plt.gca()
 dist_to_target = np.linalg.norm(traj - tar_hist, axis=1)
 ax_r.plot(time_steps, dist_to_target, 'm-', linewidth=2.5, label='Relative Distance')
-ax_r.axhline(0.1, color='k', linestyle='--', linewidth=1.5, label='Docking Tolerance (0.1m)')
-ax_r.annotate('Exponential Convergence', xy=(time_steps[len(time_steps)//2], dist_to_target[len(time_steps)//2]), 
-             xytext=(time_steps[len(time_steps)//3], dist_to_target[len(time_steps)//3] + 0.5),
-             arrowprops=dict(facecolor='black', arrowstyle='->'), fontsize=10)
+ax_r.axhline(0.2, color='k', linestyle='--', linewidth=1.5, label='Docking Tolerance (0.2m)')
+# ax_r.annotate('Exponential Convergence', xy=(time_steps[len(time_steps)//2], dist_to_target[len(time_steps)//2]), 
+#              xytext=(time_steps[len(time_steps)//3], dist_to_target[len(time_steps)//3] + 0.5),
+#              arrowprops=dict(facecolor='black', arrowstyle='->'), fontsize=10)
 ax_r.set_xlabel('Time (s)')
 ax_r.set_ylabel('Distance to Target (m)')
 ax_r.legend()
