@@ -349,154 +349,156 @@ with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as vie
     while viewer.is_running():
         step_start = time.time()
         
-        # --- 0. WIND DISTURBANCE PHYSICS (Random Walk) ---
-        wind_true += np.random.normal(0, 0.1, 3) * model.opt.timestep
-        wind_true = np.clip(wind_true, -2.5, 2.5) # Limit extreme hurricane winds
+        if not paused:
         
-        # Apply wind physically to the Target
-        v_target_true = v_target_true * 0.995 + wind_true * model.opt.timestep # 0.995 is slight drag
-        p_target_true += v_target_true * model.opt.timestep
-        
-        target_mocap_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target") # Change "target" to whatever it's named in your XML
-        data.mocap_pos[target_mocap_id] = p_target_true
-        
-        # Apply wind physically to the Chaser (External Force mapping)
-        data.qfrc_applied[0:3] = MASS * wind_true
-        
-        # --- 1. SENSOR READINGS ---
-        pos = data.qpos[0:3]
-        quat = data.qpos[3:7] 
-        lin_vel = data.qvel[0:3] 
-        ang_vel = data.qvel[3:6] 
-        
-        w, xq, yq, zq = quat
-        roll  = np.arctan2(2*(w*xq + yq*zq), 1 - 2*(xq**2 + yq**2))
-        pitch = np.arcsin(2*(w*yq - zq*xq))
-        yaw   = np.arctan2(2*(w*zq + xq*yq), 1 - 2*(yq**2 + zq**2))
+            # --- 0. WIND DISTURBANCE PHYSICS (Random Walk) ---
+            wind_true += np.random.normal(0, 0.1, 3) * model.opt.timestep
+            wind_true = np.clip(wind_true, -2.5, 2.5) # Limit extreme hurricane winds
+            
+            # Apply wind physically to the Target
+            v_target_true = v_target_true * 0.995 + wind_true * model.opt.timestep # 0.995 is slight drag
+            p_target_true += v_target_true * model.opt.timestep
+            
+            target_mocap_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target") # Change "target" to whatever it's named in your XML
+            data.mocap_pos[target_mocap_id] = p_target_true
+            
+            # Apply wind physically to the Chaser (External Force mapping)
+            data.qfrc_applied[0:3] = MASS * wind_true
+            
+            # --- 1. SENSOR READINGS ---
+            pos = data.qpos[0:3]
+            quat = data.qpos[3:7] 
+            lin_vel = data.qvel[0:3] 
+            ang_vel = data.qvel[3:6] 
+            
+            w, xq, yq, zq = quat
+            roll  = np.arctan2(2*(w*xq + yq*zq), 1 - 2*(xq**2 + yq**2))
+            pitch = np.arcsin(2*(w*yq - zq*xq))
+            yaw   = np.arctan2(2*(w*zq + xq*yq), 1 - 2*(yq**2 + zq**2))
 
-        # --- 2. NMPC OUTER LOOP (Runs at 10Hz) ---
-        if data.time - last_nmpc_time >= NMPC_DT:
-            chaser_hist.append(pos.copy()) 
-            if len(chaser_hist) > 200: chaser_hist.pop(0) 
-            
-            # ====================================================
-            # 1. TARGET ESTIMATION (6D EKF) - DO THIS FIRST!
-            # ====================================================
-            z_tar = p_target_true + np.random.normal(0, 0.01, 3)
-            x_tar_hat, P_tar = target_predict(x_tar_hat, P_tar)
-            x_tar_hat, P_tar = target_update(x_tar_hat, P_tar, z_tar)
-            p_tar_hat = x_tar_hat[0:3]
-
-            # ====================================================
-            # 2. CHASER ESTIMATION (9D EKF with Wind)
-            # ====================================================
-            z_cha = pos + np.random.normal(0, 0.01, 3)
-            x_hat, P_ekf = ekf_predict(x_hat, P_ekf, u_acc_prev)
-            x_hat, P_ekf = ekf_update(x_hat, P_ekf, z_cha)
-            
-            # Build 12D State for NMPC using EKF estimates (Pos/Vel/Wind)
-            state_12d = np.array([
-                x_hat[0], x_hat[1], x_hat[2],   # px, py, pz
-                x_hat[3], x_hat[4], x_hat[5],   # vx, vy, vz
-                roll, pitch, last_thrust_state, # roll, pitch, thrust
-                x_hat[6], x_hat[7], x_hat[8]    # wx, wy, wz (Live Wind Estimate)
-            ])
-            
-            # ====================================================
-            # 3. PHASE LOGIC & NMPC SOLVE
-            # ====================================================
-            # FSM triggers based strictly on ESTIMATED positions
-            dist_xy = np.linalg.norm(x_hat[0:2] - p_tar_hat[0:2])
-            if current_phase == 0 and dist_xy < 0.2:
-                current_phase = 1
-                print(f"[{data.time:.1f}s] FSM TRIGGER: Phase 1 (Cone) Activated!")
-
-            # Solve NMPC using 12D State
-            is_first = (last_nmpc_time < 0)
-            u_opt, step_cost, step_delta, step_trust = nmpc_planner.solve(
-                state_12d, p_tar_hat, current_phase, is_first_step=is_first
-            )
-            
-            # Extract NMPC commands
-            target_roll = u_opt[0]
-            target_pitch = u_opt[1]
-            target_acc = u_opt[2]
-            
-            # ====================================================
-            # 4. LOGGING & STATE PREP FOR NEXT LOOP
-            # ====================================================
-            x_hist.append(state_12d.copy())
-            tar_hist.append(p_target_true.copy())
-            tar_est_hist.append(p_tar_hat.copy())
-            u_hist.append(u_opt.copy())
-            time_steps_log.append(data.time)
-            cost_history.append(step_cost)
-            delta_history.append(step_delta)
-            trust_history.append(step_trust)
-            
-            # Convert NMPC [roll, pitch, thrust] into Cartesian [ax, ay, az] for the next EKF Predict step
-            u_acc_prev = np.array([
-                target_acc * np.sin(target_pitch),
-                -target_acc * np.sin(target_roll) * np.cos(target_pitch),
-                target_acc * np.cos(target_roll) * np.cos(target_pitch) - GRAVITY
-            ])
-            
-            last_thrust_state = target_acc 
-            last_nmpc_time = data.time
-            
-            # Print the live wind estimate so you can watch it learn!
-            print(f"NMPC Updated at t={data.time:.2f}s | Phase: {current_phase} | Est. Wind: [{x_hat[6]:.2f}, {x_hat[7]:.2f}, {x_hat[8]:.2f}] m/s²")
-        # --- 3. MUJOCO INNER LOOP (Runs at 500Hz) ---
-        # Convert NMPC Target Angles to Motor Torques
-        err_roll  = target_roll - roll
-        err_pitch = target_pitch - pitch
-        err_yaw   = 0.0 - yaw
-        
-        u_roll  = pd_roll.compute(err_roll,  0.0 - ang_vel[0])
-        u_pitch = pd_pitch.compute(err_pitch, 0.0 - ang_vel[1])
-        u_yaw   = pd_yaw.compute(err_yaw,    0.0 - ang_vel[2])
-        
-        # Convert NMPC Target Acceleration to physical Force
-        total_thrust = MASS * target_acc
-        
-        data.ctrl[0] = np.clip(total_thrust, 0, 0.35) 
-        data.ctrl[1] = -u_roll
-        data.ctrl[2] = -u_pitch
-        data.ctrl[3] = -u_yaw
-
-        mujoco.mj_step(model, data)
-        
-        
-        # --- 4. HOLOGRAPHIC VISUALIZATIONS ---
-        with viewer.lock():
-            viewer.user_scn.ngeom = 0 # Clear old lines
-            
-            # A. Draw Past Trajectory (Solid Red Line)
-            for i in range(len(chaser_hist)-1):
-                draw_line(viewer, chaser_hist[i], chaser_hist[i+1], np.array([1, 0, 0, 1]), width=2)
+            # --- 2. NMPC OUTER LOOP (Runs at 10Hz) ---
+            if data.time - last_nmpc_time >= NMPC_DT:
+                chaser_hist.append(pos.copy()) 
+                if len(chaser_hist) > 200: chaser_hist.pop(0) 
                 
-            # B. Draw SCP Lookahead Trajectory (Flickering Green Line)
-            # nmpc_planner.X_nom contains the 25-step future path
-            lookahead = nmpc_planner.X_nom[:, 0:3]
-            for i in range(len(lookahead)-1):
-                draw_line(viewer, lookahead[i], lookahead[i+1], np.array([0, 1, 0, 1]), width=4)
+                # ====================================================
+                # 1. TARGET ESTIMATION (6D EKF) - DO THIS FIRST!
+                # ====================================================
+                z_tar = p_target_true + np.random.normal(0, 0.01, 3)
+                x_tar_hat, P_tar = target_predict(x_tar_hat, P_tar)
+                x_tar_hat, P_tar = target_update(x_tar_hat, P_tar, z_tar)
+                p_tar_hat = x_tar_hat[0:3]
 
-            # C. Draw Proper Wireframe Docking Cone (Cyan)
-            # cone_apex = p_target_true
+                # ====================================================
+                # 2. CHASER ESTIMATION (9D EKF with Wind)
+                # ====================================================
+                z_cha = pos + np.random.normal(0, 0.01, 3)
+                x_hat, P_ekf = ekf_predict(x_hat, P_ekf, u_acc_prev)
+                x_hat, P_ekf = ekf_update(x_hat, P_ekf, z_cha)
+                
+                # Build 12D State for NMPC using EKF estimates (Pos/Vel/Wind)
+                state_12d = np.array([
+                    x_hat[0], x_hat[1], x_hat[2],   # px, py, pz
+                    x_hat[3], x_hat[4], x_hat[5],   # vx, vy, vz
+                    roll, pitch, last_thrust_state, # roll, pitch, thrust
+                    x_hat[6], x_hat[7], x_hat[8]    # wx, wy, wz (Live Wind Estimate)
+                ])
+                
+                # ====================================================
+                # 3. PHASE LOGIC & NMPC SOLVE
+                # ====================================================
+                # FSM triggers based strictly on ESTIMATED positions
+                dist_xy = np.linalg.norm(x_hat[0:2] - p_tar_hat[0:2])
+                if current_phase == 0 and dist_xy < 0.2:
+                    current_phase = 1
+                    print(f"[{data.time:.1f}s] FSM TRIGGER: Phase 1 (Cone) Activated!")
+
+                # Solve NMPC using 12D State
+                is_first = (last_nmpc_time < 0)
+                u_opt, step_cost, step_delta, step_trust = nmpc_planner.solve(
+                    state_12d, p_tar_hat, current_phase, is_first_step=is_first
+                )
+                
+                # Extract NMPC commands
+                target_roll = u_opt[0]
+                target_pitch = u_opt[1]
+                target_acc = u_opt[2]
+                
+                # ====================================================
+                # 4. LOGGING & STATE PREP FOR NEXT LOOP
+                # ====================================================
+                x_hist.append(state_12d.copy())
+                tar_hist.append(p_target_true.copy())
+                tar_est_hist.append(p_tar_hat.copy())
+                u_hist.append(u_opt.copy())
+                time_steps_log.append(data.time)
+                cost_history.append(step_cost)
+                delta_history.append(step_delta)
+                trust_history.append(step_trust)
+                
+                # Convert NMPC [roll, pitch, thrust] into Cartesian [ax, ay, az] for the next EKF Predict step
+                u_acc_prev = np.array([
+                    target_acc * np.sin(target_pitch),
+                    -target_acc * np.sin(target_roll) * np.cos(target_pitch),
+                    target_acc * np.cos(target_roll) * np.cos(target_pitch) - GRAVITY
+                ])
+                
+                last_thrust_state = target_acc 
+                last_nmpc_time = data.time
+                
+                # Print the live wind estimate so you can watch it learn!
+                print(f"NMPC Updated at t={data.time:.2f}s | Phase: {current_phase} | Est. Wind: [{x_hat[6]:.2f}, {x_hat[7]:.2f}, {x_hat[8]:.2f}] m/s²")
+            # --- 3. MUJOCO INNER LOOP (Runs at 500Hz) ---
+            # Convert NMPC Target Angles to Motor Torques
+            err_roll  = target_roll - roll
+            err_pitch = target_pitch - pitch
+            err_yaw   = 0.0 - yaw
             
-            final_target_pos = tar_hist[-1]
-            cone_apex = final_target_pos
+            u_roll  = pd_roll.compute(err_roll,  0.0 - ang_vel[0])
+            u_pitch = pd_pitch.compute(err_pitch, 0.0 - ang_vel[1])
+            u_yaw   = pd_yaw.compute(err_yaw,    0.0 - ang_vel[2])
             
-            cone_length = 1.0
-            cone_radius = cone_length * np.tan(np.radians(30)) # THETA = 30
-            for angle in np.linspace(0, 2*np.pi, 10, endpoint=False):
-                # base_pt = cone_apex + np.array([cone_radius*np.cos(angle), cone_radius*np.sin(angle), -cone_length])
-                base_pt = cone_apex + np.array([
-                        cone_radius*np.cos(angle),
-                        cone_radius*np.sin(angle),
-                        cone_length   # ✅ NOW it goes upward
-                    ])
-                draw_line(viewer, cone_apex, base_pt, np.array([0, 1, 1, 0.4]), width=2)
+            # Convert NMPC Target Acceleration to physical Force
+            total_thrust = MASS * target_acc
+            
+            data.ctrl[0] = np.clip(total_thrust, 0, 0.35) 
+            data.ctrl[1] = -u_roll
+            data.ctrl[2] = -u_pitch
+            data.ctrl[3] = -u_yaw
+
+            mujoco.mj_step(model, data)
+            
+            
+            # --- 4. HOLOGRAPHIC VISUALIZATIONS ---
+            with viewer.lock():
+                viewer.user_scn.ngeom = 0 # Clear old lines
+                
+                # A. Draw Past Trajectory (Solid Red Line)
+                for i in range(len(chaser_hist)-1):
+                    draw_line(viewer, chaser_hist[i], chaser_hist[i+1], np.array([1, 0, 0, 1]), width=2)
+                    
+                # B. Draw SCP Lookahead Trajectory (Flickering Green Line)
+                # nmpc_planner.X_nom contains the 25-step future path
+                lookahead = nmpc_planner.X_nom[:, 0:3]
+                for i in range(len(lookahead)-1):
+                    draw_line(viewer, lookahead[i], lookahead[i+1], np.array([0, 1, 0, 1]), width=4)
+
+                # C. Draw Proper Wireframe Docking Cone (Cyan)
+                # cone_apex = p_target_true
+                
+                final_target_pos = tar_hist[-1]
+                cone_apex = final_target_pos
+                
+                cone_length = 1.0
+                cone_radius = cone_length * np.tan(np.radians(30)) # THETA = 30
+                for angle in np.linspace(0, 2*np.pi, 10, endpoint=False):
+                    # base_pt = cone_apex + np.array([cone_radius*np.cos(angle), cone_radius*np.sin(angle), -cone_length])
+                    base_pt = cone_apex + np.array([
+                            cone_radius*np.cos(angle),
+                            cone_radius*np.sin(angle),
+                            cone_length   # ✅ NOW it goes upward
+                        ])
+                    draw_line(viewer, cone_apex, base_pt, np.array([0, 1, 1, 0.4]), width=2)
 
         viewer.sync()
 
