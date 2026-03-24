@@ -92,7 +92,7 @@ class DroneNMPC:
             cost = 0
             con = [X[0, :] == x_true]
             # offset = np.array([0.0, 0.0, 0.5]) if phase == 0 else np.zeros(3)
-            offset = np.array([0.0, 0.0, 0.5]) if phase == 0 else np.array([0.0, 0.0, 0.2])
+            offset = np.array([0.0, 0.0, 0.2]) if phase == 0 else np.array([0.0, 0.0, 0.2])
             
             
             cost += cp.sum_squares(X[-1, 0:3] - (p_target + offset)) * 1000.0
@@ -662,13 +662,13 @@ for p_c, p_t in zip(traj, tar_hist):
         
 ax_cone.plot(time_steps, angles, 'c-', linewidth=2, label='Approaching Angle')
 # Highlight violation limit (Red dashed)
-ax_cone.axhline(np.degrees(THETA), color='r', linestyle='--', linewidth=2, label=f'Violation Limit ({np.degrees(THETA)}°)')
+ax_cone.axhline(np.degrees(THETA), color='r', linestyle='--', linewidth=2, label=f'Violation Limit ({30}°)')
 # Docking time annotation
 ax_cone.axvline(dock_time, color='k', linestyle=':', linewidth=1.5, label='Docking Achieved')
 
 ax_cone.set_xlabel('Time (s)')
 ax_cone.set_ylabel('Approach angle $\\phi$ (deg)')
-ax_cone.legend()
+ax_cone.legend(loc="upper right")
 plt.tight_layout()
 fig6.savefig("ieee_plots/6_docking_cone_angle.png", dpi=300, bbox_inches='tight')
 
@@ -677,7 +677,7 @@ fig8 = plt.figure(figsize=SINGLE_COL)
 ax_r = plt.gca()
 dist_to_target = np.linalg.norm(traj - tar_hist, axis=1)
 ax_r.plot(time_steps, dist_to_target, 'm-', linewidth=2.5, label='Relative Distance')
-ax_r.axhline(0.1, color='k', linestyle='--', linewidth=1.5, label='Docking Tolerance (0.1m)')
+ax_r.axhline(0.2, color='k', linestyle='--', linewidth=1.5, label='Docking Tolerance (0.2m)')
 
 # Annotate convergence rate
 # ax_r.annotate('Exponential Convergence', xy=(time_steps[len(time_steps)//2], dist_to_target[len(time_steps)//2]), 
