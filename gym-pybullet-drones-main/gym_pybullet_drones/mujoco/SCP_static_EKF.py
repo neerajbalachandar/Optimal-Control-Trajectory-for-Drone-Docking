@@ -24,48 +24,56 @@ class DroneNMPC:
         self.N_APP = np.array([0, 0, -1])
         self.r_dock = 0
         
-        # Warm start buffers
-        self.X_nom = np.zeros((self.N, 9))
+        # Warm start buffers upgraded to 12D
+        self.X_nom = np.zeros((self.N, 12))
         self.u_nom = np.zeros((self.N-1, 3))
         self.u_nom[:, 2] = self.GRAVITY
 
-        self.MAX_ITERS = 4 # Lowered slightly for live simulation speed
+        self.MAX_ITERS = 4 
         self.TOL = 1e-3
 
     def f_dyn(self, x, u):
-        px, py, pz, vx, vy, vz, phi, theta, a_T = x
+        px, py, pz, vx, vy, vz, phi, theta, a_T, wx, wy, wz = x
         phi_cmd, theta_cmd, a_cmd = u
         tau_rp, tau_t = 0.1, 0.05
         return np.array([
             vx, vy, vz,
-            a_T * np.sin(theta),
-            -a_T * np.sin(phi) * np.cos(theta),
-            a_T * np.cos(phi) * np.cos(theta) - self.GRAVITY,
+            a_T * np.sin(theta) + wx,                        # Wind directly pushes acceleration
+            -a_T * np.sin(phi) * np.cos(theta) + wy,
+            a_T * np.cos(phi) * np.cos(theta) - self.GRAVITY + wz,
             (phi_cmd - phi) / tau_rp,
             (theta_cmd - theta) / tau_rp,
-            (a_cmd - a_T) / tau_t
+            (a_cmd - a_T) / tau_t,
+            0.0, 0.0, 0.0                                    # Wind is assumed constant over the short prediction horizon
         ])
 
     def get_jacobians(self, x, u):
-        px, py, pz, vx, vy, vz, phi, theta, a_T = x
+        px, py, pz, vx, vy, vz, phi, theta, a_T, wx, wy, wz = x
         tau_rp, tau_t = 0.1, 0.05
-        Ac = np.zeros((9, 9))
+        Ac = np.zeros((12, 12))
         Ac[0, 3] = Ac[1, 4] = Ac[2, 5] = 1.0
         Ac[3, 7] = a_T * np.cos(theta); Ac[3, 8] = np.sin(theta)
         Ac[4, 6] = -a_T * np.cos(phi) * np.cos(theta); Ac[4, 7] = a_T * np.sin(phi) * np.sin(theta); Ac[4, 8] = -np.sin(phi) * np.cos(theta)
         Ac[5, 6] = -a_T * np.sin(phi) * np.cos(theta); Ac[5, 7] = -a_T * np.cos(phi) * np.sin(theta); Ac[5, 8] = np.cos(phi) * np.cos(theta)
         Ac[6, 6] = -1.0 / tau_rp; Ac[7, 7] = -1.0 / tau_rp; Ac[8, 8] = -1.0 / tau_t
-        Bc = np.zeros((9, 3))
+        Ac[3:6, 9:12] = np.eye(3) # <--- Wind Jacobian (dv/dw = I)
+        
+        Bc = np.zeros((12, 3))
         Bc[6, 0] = 1.0 / tau_rp; Bc[7, 1] = 1.0 / tau_rp; Bc[8, 2] = 1.0 / tau_t
         return Ac, Bc
 
     def solve(self, x_true, p_target, phase, is_first_step=False):
+        
+        delta = 0.0
+        step_cost = 0.0
+        
         if is_first_step:
             for k in range(self.N):
                 al = k / (self.N - 1)
                 self.X_nom[k, 0:3] = x_true[0:3] + al * (p_target - x_true[0:3])
                 self.X_nom[k, 1] += 0.5 * np.sin(np.pi * al)
                 self.X_nom[k, 8] = self.GRAVITY
+                self.X_nom[k, 9:12] = x_true[9:12] # Initialize wind estimate along horizon
         else:
             self.X_nom[:-1, :] = self.X_nom[1:, :]
             self.X_nom[-1, :] = self.X_nom[-2, :]
@@ -75,11 +83,11 @@ class DroneNMPC:
         trust_radius = 2.0
         
         for it in range(self.MAX_ITERS):
-            X = cp.Variable((self.N, 9))
+            X = cp.Variable((self.N, 12)) # <--- 12D NMPC Variable
             u = cp.Variable((self.N-1, 3))
             slack_cone = cp.Variable(self.N-1, nonneg=True)
             slack_tar  = cp.Variable(self.N-1, nonneg=True)
-            nu = cp.Variable((self.N-1, 9)) 
+            nu = cp.Variable((self.N-1, 12)) # <--- 12D Virtual Controls
             
             cost = 0
             con = [X[0, :] == x_true]
@@ -137,6 +145,10 @@ class DroneNMPC:
 
             prob = cp.Problem(cp.Minimize(cost), con)
             prob.solve(solver=cp.CLARABEL, warm_start=True, ignore_dpp=True) 
+            
+            # if prob.status not in ["optimal", "optimal_inaccurate"]:
+            #     print(f"⚠️ SCP WARNING: CVXPY Status = {prob.status} at Iteration {iter}")
+            # break # Breaks out, meaning delta never gets calculated
             
             if prob.status not in ["optimal", "optimal_inaccurate"]:
                 trust_radius *= 0.5
@@ -245,24 +257,42 @@ B_d[3:6, :] = NMPC_DT * np.eye(3)
 
 
 # ================= TARGET POSE EKF =================
-P_tar = np.eye(3) * 0.05
-Q_tar = np.eye(3) * 1e-4   # static target small drift
-R_tar = np.eye(3) * 0.01   # sensor noise
+# ================= TARGET POSE EKF (Upgraded to 6D to track wind drift) =================
+P_tar = np.eye(6) * 0.1
+Q_tar = np.eye(6) * 0.01; Q_tar[3:6, 3:6] = np.eye(3) * 0.1 # Process noise for wind drift
+R_tar = np.eye(3) * 0.01
 
-p_tar_hat = p_target_true.copy()
+F_tar = np.eye(6)
+F_tar[0:3, 3:6] = np.eye(3) * NMPC_DT
 
-def target_predict(p_hat, P):
-    # static model
-    return p_hat, P + Q_tar
+def target_predict(x_hat, P):
+    return F_tar @ x_hat, F_tar @ P @ F_tar.T + Q_tar
 
-def target_update(p_hat, P, z):
-    H = np.eye(3)
-    y = z - H @ p_hat
+def target_update(x_hat, P, z):
+    H = np.zeros((3, 6)); H[0:3, 0:3] = np.eye(3)
+    y = z - H @ x_hat
     S = H @ P @ H.T + R_tar
     K = P @ H.T @ np.linalg.inv(S)
-    p_hat = p_hat + K @ y
-    P = (np.eye(3) - K @ H) @ P
-    return p_hat, P
+    return x_hat + K @ y, (np.eye(6) - K @ H) @ P
+
+x_tar_hat = np.zeros(6); x_tar_hat[0:3] = p_target_true.copy()
+
+# ================= CHASER EKF (Upgraded to 9D to estimate Wind Acceleration) =================
+P_ekf = np.eye(9) * 0.1
+Q_ekf = np.eye(9) * 0.05  
+Q_ekf[3:6, 3:6] = np.eye(3) * 0.2  
+Q_ekf[6:9, 6:9] = np.eye(3) * 0.5  # High process noise so wind state quickly adapts
+
+R_kf = np.eye(3) * 0.05
+
+A_d = np.eye(9)
+A_d[0:3, 3:6] = NMPC_DT * np.eye(3)
+A_d[0:3, 6:9] = 0.5 * NMPC_DT**2 * np.eye(3)
+A_d[3:6, 6:9] = NMPC_DT * np.eye(3)
+
+B_d = np.zeros((9, 3))
+B_d[0:3, :] = 0.5 * NMPC_DT**2 * np.eye(3)
+B_d[3:6, :] = NMPC_DT * np.eye(3)
 
 def ekf_predict(x_hat, P, u_acc):
     x_hat_next = A_d @ x_hat + B_d @ u_acc
@@ -270,18 +300,21 @@ def ekf_predict(x_hat, P, u_acc):
     return x_hat_next, P_next
 
 def ekf_update(x_hat, P, z):
-    H = np.zeros((3, 6))
-    H[0:3, 0:3] = np.eye(3)
+    H = np.zeros((3, 9)); H[0:3, 0:3] = np.eye(3)
     y = z - H @ x_hat
     S = H @ P @ H.T + R_kf
     K = P @ H.T @ np.linalg.inv(S)
     x_hat_next = x_hat + K @ y
-    P_next = (np.eye(6) - K @ H) @ P
+    P_next = (np.eye(9) - K @ H) @ P
     return x_hat_next, P_next
 
-# Initialize EKF state [px, py, pz, vx, vy, vz]
-x_hat = np.array([-2.5, 0.0, 1.5, 0.0, 0.0, 0.0]) 
-u_acc_prev = np.zeros(3) # Used to hold Cartesian acceleration for the EKF predict step
+# Initialize EKF state [px, py, pz, vx, vy, vz, wx, wy, wz]
+x_hat = np.zeros(9); x_hat[0:3] = np.array([-2.5, 0.0, 1.5]) 
+u_acc_prev = np.zeros(3) 
+
+# Simulation Variables for Wind Integration
+wind_true = np.zeros(3)
+v_target_true = np.zeros(3)
 
 chaser_hist = [] # Store past trajectory points
 
@@ -305,6 +338,20 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
     while viewer.is_running():
         step_start = time.time()
         
+        # --- 0. WIND DISTURBANCE PHYSICS (Random Walk) ---
+        wind_true += np.random.normal(0, 0.1, 3) * model.opt.timestep
+        wind_true = np.clip(wind_true, -2.5, 2.5) # Limit extreme hurricane winds
+        
+        # Apply wind physically to the Target
+        v_target_true = v_target_true * 0.995 + wind_true * model.opt.timestep # 0.995 is slight drag
+        p_target_true += v_target_true * model.opt.timestep
+        
+        target_mocap_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target") # Change "target" to whatever it's named in your XML
+        data.mocap_pos[target_mocap_id] = p_target_true
+        
+        # Apply wind physically to the Chaser (External Force mapping)
+        data.qfrc_applied[0:3] = MASS * wind_true
+        
         # --- 1. SENSOR READINGS ---
         pos = data.qpos[0:3]
         quat = data.qpos[3:7] 
@@ -322,53 +369,52 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             if len(chaser_hist) > 200: chaser_hist.pop(0) 
             
             # ====================================================
-            # EKF STATE ESTIMATION
+            # 1. TARGET ESTIMATION (6D EKF) - DO THIS FIRST!
             # ====================================================
-            # 1. Get Noisy Sensor Measurement (Position only, like GPS/Mocap)
-            z = pos + np.random.normal(0, 0.01, 3)
-            
-            
-            # 2. EKF Predict & Update
+            z_tar = p_target_true + np.random.normal(0, 0.01, 3)
+            x_tar_hat, P_tar = target_predict(x_tar_hat, P_tar)
+            x_tar_hat, P_tar = target_update(x_tar_hat, P_tar, z_tar)
+            p_tar_hat = x_tar_hat[0:3]
+
+            # ====================================================
+            # 2. CHASER ESTIMATION (9D EKF with Wind)
+            # ====================================================
+            z_cha = pos + np.random.normal(0, 0.01, 3)
             x_hat, P_ekf = ekf_predict(x_hat, P_ekf, u_acc_prev)
-            x_hat, P_ekf = ekf_update(x_hat, P_ekf, z)
+            x_hat, P_ekf = ekf_update(x_hat, P_ekf, z_cha)
             
-            # 3. Build 9D State for NMPC using EKF estimates for Pos/Vel
-            state_9d = np.array([
-                x_hat[0], x_hat[1], x_hat[2], 
-                x_hat[3], x_hat[4], x_hat[5], 
-                roll, pitch, last_thrust_state
+            # Build 12D State for NMPC using EKF estimates (Pos/Vel/Wind)
+            state_12d = np.array([
+                x_hat[0], x_hat[1], x_hat[2],   # px, py, pz
+                x_hat[3], x_hat[4], x_hat[5],   # vx, vy, vz
+                roll, pitch, last_thrust_state, # roll, pitch, thrust
+                x_hat[6], x_hat[7], x_hat[8]    # wx, wy, wz (Live Wind Estimate)
             ])
-            # ====================================================
             
-            # Phase Logic (Now using estimated position!)
-            dist_xy = np.linalg.norm(x_hat[0:2] - p_target_true[0:2])
+            # ====================================================
+            # 3. PHASE LOGIC & NMPC SOLVE
+            # ====================================================
+            # FSM triggers based strictly on ESTIMATED positions
+            dist_xy = np.linalg.norm(x_hat[0:2] - p_tar_hat[0:2])
             if current_phase == 0 and dist_xy < 0.2:
                 current_phase = 1
                 print(f"[{data.time:.1f}s] FSM TRIGGER: Phase 1 (Cone) Activated!")
-                
-            # p_target = p_target_true.copy() # No artificial noise here, EKF handles uncertainty
-            
-            # ===== TARGET SENSOR =====
-            z_tar = p_target_true + np.random.normal(0, 0.01, 3)
 
-            # ===== TARGET EKF =====
-            p_tar_hat, P_tar = target_predict(p_tar_hat, P_tar)
-            p_tar_hat, P_tar = target_update(p_tar_hat, P_tar, z_tar)
-
-            p_target = p_tar_hat.copy()
-
-            # Solve! 
+            # Solve NMPC using 12D State
             is_first = (last_nmpc_time < 0)
-            # u_opt = nmpc_planner.solve(state_9d, p_target, current_phase, is_first_step=is_first)
-            u_opt, step_cost, step_delta, step_trust = nmpc_planner.solve(state_9d, p_tar_hat , current_phase, is_first_step=is_first)
+            u_opt, step_cost, step_delta, step_trust = nmpc_planner.solve(
+                state_12d, p_tar_hat, current_phase, is_first_step=is_first
+            )
             
             # Extract NMPC commands
             target_roll = u_opt[0]
             target_pitch = u_opt[1]
             target_acc = u_opt[2]
             
-            
-            x_hist.append(state_9d.copy())
+            # ====================================================
+            # 4. LOGGING & STATE PREP FOR NEXT LOOP
+            # ====================================================
+            x_hist.append(state_12d.copy())
             tar_hist.append(p_target_true.copy())
             tar_est_hist.append(p_tar_hat.copy())
             u_hist.append(u_opt.copy())
@@ -386,8 +432,9 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             
             last_thrust_state = target_acc 
             last_nmpc_time = data.time
-            print(f"NMPC Updated at t={data.time:.2f}s | Phase: {current_phase} | Thrust Cmd: {target_acc:.2f}")
-
+            
+            # Print the live wind estimate so you can watch it learn!
+            print(f"NMPC Updated at t={data.time:.2f}s | Phase: {current_phase} | Est. Wind: [{x_hat[6]:.2f}, {x_hat[7]:.2f}, {x_hat[8]:.2f}] m/s²")
         # --- 3. MUJOCO INNER LOOP (Runs at 500Hz) ---
         # Convert NMPC Target Angles to Motor Torques
         err_roll  = target_roll - roll
@@ -424,7 +471,11 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
                 draw_line(viewer, lookahead[i], lookahead[i+1], np.array([0, 1, 0, 1]), width=4)
 
             # C. Draw Proper Wireframe Docking Cone (Cyan)
-            cone_apex = p_target_true
+            # cone_apex = p_target_true
+            
+            final_target_pos = tar_hist[-1]
+            cone_apex = final_target_pos
+            
             cone_length = 1.0
             cone_radius = cone_length * np.tan(np.radians(30)) # THETA = 30
             for angle in np.linspace(0, 2*np.pi, 10, endpoint=False):
