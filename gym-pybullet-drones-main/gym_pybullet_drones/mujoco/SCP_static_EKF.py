@@ -333,7 +333,18 @@ r_c = 0.1
 r_t = 0.1
 alpha_min = 1.05
 
-with mujoco.viewer.launch_passive(model, data) as viewer:
+
+
+paused = False
+
+def key_callback(keycode):
+    global paused
+    if keycode == 32:  # SPACE
+        paused = not paused
+        print("SIMULATION PAUSED" if paused else "SIMULATION RESUMED")
+
+
+with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
     
     while viewer.is_running():
         step_start = time.time()
@@ -496,10 +507,14 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             
             
 # ====================================================================
-# IEEE STYLE PLOTTING
+# IEEE PUBLICATION PLOTS (REVISED & AUTO-SAVING)
 # ====================================================================
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import os
+
+# Create a folder for the plots so they don't clutter your main directory
+os.makedirs("ieee_plots", exist_ok=True)
 
 x_hist = np.array(x_hist)
 tar_hist = np.array(tar_hist)
@@ -508,6 +523,8 @@ u_hist = np.array(u_hist)
 time_steps = np.array(time_steps_log)
 
 U_MAX = nmpc_planner.U_MAX
+U_MIN = nmpc_planner.U_MIN
+MAX_TILT = nmpc_planner.MAX_TILT
 V_MAX = nmpc_planner.V_MAX
 P_OBS = nmpc_planner.P_OBS
 R_OBS = nmpc_planner.R_OBS
@@ -516,90 +533,119 @@ N_APP = nmpc_planner.N_APP
 THETA = nmpc_planner.THETA
 TOL = nmpc_planner.TOL
 
-# Enforce IEEE Publication Standards
+# Enforce IEEE Publication Standards (Large fonts, Serif, No Titles, No Fills)
 mpl.rcParams.update({
     'font.family': 'serif',
-    'font.size': 14,
-    'axes.labelsize': 14,
-    'xtick.labelsize': 12,
-    'ytick.labelsize': 12,
-    'legend.fontsize': 11,
+    'font.size': 12,
+    'axes.labelsize': 13,
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
+    'legend.fontsize': 10,
     'lines.linewidth': 2,
     'axes.grid': True,
     'grid.alpha': 0.4,
     'grid.color': '#b0b0b0',
-    'axes.titlesize': 0  # Forces no titles globally
+    'axes.titlesize': 0  
 })
 
-SINGLE_COL = (4.0, 3.0) 
+SINGLE_COL = (4.0, 3.2) 
 traj = x_hist[:, 0:3]
+dock_time = time_steps[-1]
 
-# ----------------- FIGURE 1: 3D Trajectory -----------------
+# ⭐ NEW PLOT: Target Estimation Performance
+fig_est = plt.figure(figsize=SINGLE_COL)
+ax_est = plt.gca()
+est_error = np.linalg.norm(tar_hist - tar_est_hist, axis=1)
+ax_est.plot(time_steps, est_error, 'k-', linewidth=2, label='$||p_{target} - \hat{p}_{target}||$')
+ax_est.set_xlabel('Time (s)')
+ax_est.set_ylabel('Estimation Error (m)')
+ax_est.legend()
+plt.tight_layout()
+fig_est.savefig("ieee_plots/0_target_estimation_error.png", dpi=300, bbox_inches='tight')
+
+# ✅ FIG 1: 3D Trajectory (Main Result)
 fig1 = plt.figure(figsize=(4.5, 4.5))
 ax1 = fig1.add_subplot(111, projection='3d')
-ax1.plot(traj[:,0], traj[:,1], traj[:,2], 'b.-', linewidth=3, label='Chaser Traj')
+# Faded nominal straight-line path
+ax1.plot([traj[0,0], tar_hist[0,0]], [traj[0,1], tar_hist[0,1]], [traj[0,2], tar_hist[0,2]], 
+         color='gray', linestyle=':', linewidth=1.5, label='Nominal Direct Path')
+# Thicker chaser line
+ax1.plot(traj[:,0], traj[:,1], traj[:,2], 'b-', linewidth=3.5, label='Executed Chaser Traj')
 ax1.plot(tar_hist[:,0], tar_hist[:,1], tar_hist[:,2], 'r-', linewidth=2, label='True Moving Target')
-ax1.plot(tar_est_hist[:,0], tar_est_hist[:,1], tar_est_hist[:,2], 'y--', alpha=0.7, label='EKF Target Estimate')
-ax1.plot(traj[0,0], traj[0,1], traj[0,2], 'go', markersize=8, label='Start')
+ax1.plot([traj[0,0]], [traj[0,1]], [traj[0,2]], 'go', markersize=6, label='Start')
+# Docking point marker
+ax1.plot([tar_hist[-1,0]], [tar_hist[-1,1]], [tar_hist[-1,2]], 'r*', markersize=10, label='Docking Point')
 
+# Semi-transparent obstacle
 u_sph, v_sph = np.mgrid[0:2*np.pi:20j, 0:np.pi:10j]
 x_sph = P_OBS[0] + R_OBS*np.cos(u_sph)*np.sin(v_sph)
 y_sph = P_OBS[1] + R_OBS*np.sin(u_sph)*np.sin(v_sph)
 z_sph = P_OBS[2] + R_OBS*np.cos(v_sph)
-ax1.plot_surface(x_sph, y_sph, z_sph, color='r', alpha=0.3)
-ax1.legend()
-plt.tight_layout()
+ax1.plot_surface(x_sph, y_sph, z_sph, color='r', alpha=0.15, edgecolor='none')
 
-# ----------------- FIGURE 2: Control Inputs -----------------
-fig2 = plt.figure(figsize=SINGLE_COL)
-ax_u = plt.gca()
-ax_u.plot(time_steps, u_hist[:, 0], 'r', label='$u_x$')
-ax_u.plot(time_steps, u_hist[:, 1], 'g', label='$u_y$')
-ax_u.plot(time_steps, u_hist[:, 2], 'b', label='$u_z$')
-ax_u.axhline(U_MAX, color='k', linestyle='--', label='$+U_{max}$')
-ax_u.axhline(-U_MAX, color='k', linestyle='--')
-ax_u.set_xlabel('Time (s)')
-ax_u.set_ylabel('Control')
-ax_u.legend(loc='upper right')
-plt.tight_layout()
+# Static snapshot of Cone at final docking location
+cone_apex = tar_hist[-1]
+cone_length = 1.0
+cone_radius = cone_length * np.tan(THETA)
+for angle in np.linspace(0, 2*np.pi, 8, endpoint=False):
+    base_pt = cone_apex + np.array([cone_radius*np.cos(angle), cone_radius*np.sin(angle), cone_length])
+    ax1.plot([cone_apex[0], base_pt[0]], [cone_apex[1], base_pt[1]], [cone_apex[2], base_pt[2]], 'c-', alpha=0.6)
 
-# ----------------- FIGURE 3: Velocity -----------------
+ax1.set_xlabel('X (m)'); ax1.set_ylabel('Y (m)'); ax1.set_zlabel('Z (m)')
+ax1.legend(loc='upper left', bbox_to_anchor=(0.1, 1.05))
+plt.tight_layout()
+fig1.savefig("ieee_plots/1_3D_trajectory.png", dpi=300, bbox_inches='tight')
+
+# ✅ FIG 2: Control Inputs (Split: Tilt & Thrust)
+fig2, (ax_tilt, ax_thr) = plt.subplots(2, 1, figsize=(4.0, 4.5), sharex=True)
+# Subplot 1: Tilt
+ax_tilt.plot(time_steps, np.degrees(u_hist[:, 0]), 'r-', label='Roll Cmd ($\\phi$)')
+ax_tilt.plot(time_steps, np.degrees(u_hist[:, 1]), 'g-', label='Pitch Cmd ($\\theta$)')
+ax_tilt.axhline(np.degrees(MAX_TILT), color='k', linestyle='--', linewidth=1.5, label='Tilt Limit')
+ax_tilt.axhline(-np.degrees(MAX_TILT), color='k', linestyle='--', linewidth=1.5)
+ax_tilt.set_ylabel('Tilt Angle (deg)')
+ax_tilt.legend(loc='upper right')
+# Subplot 2: Thrust
+ax_thr.plot(time_steps, u_hist[:, 2], 'b-', label='Thrust Cmd ($a_T$)')
+ax_thr.axhline(U_MAX, color='k', linestyle='--', linewidth=1.5, label='Max Thrust')
+ax_thr.axhline(U_MIN, color='k', linestyle='--', linewidth=1.5, label='Min Thrust')
+ax_thr.set_xlabel('Time (s)')
+ax_thr.set_ylabel('Thrust ($m/s^2$)')
+ax_thr.legend(loc='lower right')
+plt.tight_layout()
+fig2.savefig("ieee_plots/2_control_inputs.png", dpi=300, bbox_inches='tight')
+
+# ✅ FIG 3: Velocity Norm
 fig3 = plt.figure(figsize=SINGLE_COL)
 ax_v = plt.gca()
 v_norms = np.linalg.norm(x_hist[:, 3:6], axis=1)
-ax_v.plot(time_steps, v_norms, 'purple', linewidth=2, label='$||v||_2$')
-ax_v.axhline(V_MAX, color='k', linestyle='--', label='$V_{max}$')
+ax_v.plot(time_steps, v_norms, 'purple', linewidth=2.5, label='$||v||_2$')
+ax_v.axhline(V_MAX, color='k', linestyle='--', linewidth=2, label='$V_{max}$ Constraint')
 ax_v.set_xlabel('Time (s)')
-ax_v.set_ylabel('Velocity ($m/s$)')
+ax_v.set_ylabel('Velocity Magnitude ($m/s$)')
 ax_v.legend(loc='upper right')
 plt.tight_layout()
+fig3.savefig("ieee_plots/3_velocity_norm.png", dpi=300, bbox_inches='tight')
 
-# ----------------- FIGURE 4: Obstacle Distance -----------------
+# ✅ FIG 4: Obstacle Distance
 fig4 = plt.figure(figsize=SINGLE_COL)
 ax_obs = plt.gca()
 dist_obs = np.linalg.norm(traj - P_OBS, axis=1)
-ax_obs.plot(time_steps, dist_obs, 'r', linewidth=2)
-ax_obs.axhline(R_OBS + R_SAFE, color='k', linestyle='--', label=f'Safe Dist ({R_OBS + R_SAFE}m)')
-ax_obs.fill_between(time_steps, 0, R_OBS + R_SAFE, color='red', alpha=0.1)
+min_dist = np.min(dist_obs)
+min_idx = np.argmin(dist_obs)
+
+ax_obs.plot(time_steps, dist_obs, 'r-', linewidth=2)
+# Bold boundary, NO fill
+ax_obs.axhline(R_OBS + R_SAFE, color='k', linestyle='-', linewidth=2.5, label=f'Safe Boundary ({R_OBS + R_SAFE}m)')
+# Marker for min distance
+ax_obs.plot(time_steps[min_idx], min_dist, 'ko', markersize=6, label=f'Min Dist: {min_dist:.2f}m')
 ax_obs.set_xlabel('Time (s)')
 ax_obs.set_ylabel('Distance to Obstacle (m)')
 ax_obs.legend()
 plt.tight_layout()
+fig4.savefig("ieee_plots/4_obstacle_distance.png", dpi=300, bbox_inches='tight')
 
-# ----------------- FIGURE 5: Target Alpha (DCOL) -----------------
-fig5 = plt.figure(figsize=SINGLE_COL)
-ax_tar = plt.gca()
-alpha_history = [np.linalg.norm(p_c - p_t) / (r_c + r_t) for p_c, p_t in zip(traj, tar_hist)]
-ax_tar.plot(time_steps, alpha_history, 'g', linewidth=2)
-ax_tar.axhline(alpha_min, color='k', linestyle='--', label=f'$\\alpha_{{min}}$ ({alpha_min})')
-ax_tar.axhline(1.0, color='red', linestyle='-', label='Collision')
-ax_tar.fill_between(time_steps, 0, 1.0, color='red', alpha=0.1)
-ax_tar.set_xlabel('Time (s)')
-ax_tar.set_ylabel('DCOL $\\alpha$ Scale')
-ax_tar.legend()
-plt.tight_layout()
-
-# ----------------- FIGURE 6: Docking Cone -----------------
+# ✅ FIG 6: Docking Cone Angle
 fig6 = plt.figure(figsize=SINGLE_COL)
 ax_cone = plt.gca()
 angles = []
@@ -612,48 +658,51 @@ for p_c, p_t in zip(traj, tar_hist):
         cos_phi = np.clip(np.dot(-N_APP, p_rel) / dist, -1.0, 1.0)
         angles.append(np.degrees(np.arccos(cos_phi)))
         
-ax_cone.plot(time_steps, angles, 'c', linewidth=2)
-ax_cone.axhline(np.degrees(THETA), color='k', linestyle='--', label=f'Cone Limit ({np.degrees(THETA)}°)')
-ax_cone.fill_between(time_steps, 0, np.degrees(THETA), color='cyan', alpha=0.1)
+ax_cone.plot(time_steps, angles, 'c-', linewidth=2, label='Approaching Angle')
+# Highlight violation limit (Red dashed)
+ax_cone.axhline(np.degrees(THETA), color='r', linestyle='--', linewidth=2, label=f'Violation Limit ({np.degrees(THETA)}°)')
+# Docking time annotation
+ax_cone.axvline(dock_time, color='k', linestyle=':', linewidth=1.5, label='Docking Achieved')
+
 ax_cone.set_xlabel('Time (s)')
-ax_cone.set_ylabel('Approach Angle (deg)')
+ax_cone.set_ylabel('Approach angle $\\phi$ (deg)')
 ax_cone.legend()
 plt.tight_layout()
+fig6.savefig("ieee_plots/6_docking_cone_angle.png", dpi=300, bbox_inches='tight')
 
-# ----------------- FIGURE 7: Objective Cost -----------------
-fig7 = plt.figure(figsize=SINGLE_COL)
-ax_c = plt.gca()
-iters = range(1, len(cost_history)+1)
-ax_c.plot(iters, cost_history, 'mo-', linewidth=2)
-ax_c.set_xlabel('NMPC Step')
-ax_c.set_ylabel('Objective Cost')
-plt.tight_layout()
-
-# ----------------- FIGURE 8: Distance to Target -----------------
+# ✅ FIG 8: Distance to Target (Interception Performance)
 fig8 = plt.figure(figsize=SINGLE_COL)
 ax_r = plt.gca()
 dist_to_target = np.linalg.norm(traj - tar_hist, axis=1)
-ax_r.plot(time_steps, dist_to_target, 'mo-', linewidth=2)
+ax_r.plot(time_steps, dist_to_target, 'm-', linewidth=2.5, label='Relative Distance')
+ax_r.axhline(0.1, color='k', linestyle='--', linewidth=1.5, label='Docking Tolerance (0.1m)')
+
+# Annotate convergence rate
+ax_r.annotate('Exponential Convergence', xy=(time_steps[len(time_steps)//2], dist_to_target[len(time_steps)//2]), 
+             xytext=(time_steps[len(time_steps)//3], dist_to_target[len(time_steps)//3] + 0.5),
+             arrowprops=dict(facecolor='black', arrowstyle='->'), fontsize=10)
+
 ax_r.set_xlabel('Time (s)')
 ax_r.set_ylabel('Distance to Target (m)')
+ax_r.legend()
 plt.tight_layout()
+fig8.savefig("ieee_plots/8_distance_to_target.png", dpi=300, bbox_inches='tight')
 
-# ----------------- FIGURE 9: Max Trajectory Change -----------------
-fig9 = plt.figure(figsize=SINGLE_COL)
-ax_d = plt.gca()
-ax_d.semilogy(iters, delta_history, 'co-', linewidth=2)
-ax_d.axhline(TOL, color='k', linestyle='--', label='Tolerance')
-ax_d.set_xlabel('NMPC Step')
+# ----------------- Solver Metrics (Cost, Trust Region, Delta) -----------------
+fig_metrics, (ax_c, ax_d, ax_t) = plt.subplots(3, 1, figsize=(4.0, 6.0), sharex=True)
+iters = range(1, len(cost_history)+1)
+
+ax_c.plot(iters, cost_history, 'm-', linewidth=2)
+ax_c.set_ylabel('Objective Cost')
+
+ax_d.semilogy(iters, delta_history, 'c-', linewidth=2)
+ax_d.axhline(TOL, color='k', linestyle='--', linewidth=1.5)
 ax_d.set_ylabel('Max Change $\\delta$')
-ax_d.legend()
-plt.tight_layout()
 
-# ----------------- FIGURE 10: Trust Region Radius -----------------
-fig10 = plt.figure(figsize=SINGLE_COL)
-ax_t = plt.gca()
-ax_t.plot(iters, trust_history, 'yo-', linewidth=2)
+ax_t.plot(iters, trust_history, 'y-', linewidth=2)
 ax_t.set_xlabel('NMPC Step')
 ax_t.set_ylabel('Trust Radius (m)')
 plt.tight_layout()
+fig_metrics.savefig("ieee_plots/9_solver_metrics.png", dpi=300, bbox_inches='tight')
 
 plt.show()

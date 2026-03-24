@@ -27,7 +27,7 @@
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
       <body name="obstacle" pos="-1.0 0.0 1.25">
-                  <geom type="sphere" size="0.4" rgba="1 0 0 0.5" contype="0" conaffinity="0"/>
+                  <geom type="sphere" size="0.4" rgba="1 0 0 0.2" contype="0" conaffinity="0"/>
               </body>
 
 
