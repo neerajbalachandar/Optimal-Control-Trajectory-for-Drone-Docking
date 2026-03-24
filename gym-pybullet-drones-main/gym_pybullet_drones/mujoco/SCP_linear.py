@@ -568,7 +568,7 @@ for p_c, p_t in zip(traj, tar_hist):
         angles.append(np.degrees(np.arccos(cos_phi)))
         
 ax_cone.plot(time_steps, angles, 'c-', linewidth=2, label='Approaching Angle')
-ax_cone.axhline(np.degrees(THETA), color='r', linestyle='--', linewidth=2, label=f'Violation Limit ({np.degrees(THETA)}°)')
+ax_cone.axhline(np.degrees(THETA), color='r', linestyle='--', linewidth=2, label=f'Violation Limit ({30}°)')
 ax_cone.axvline(dock_time, color='k', linestyle=':', linewidth=1.5, label='Docking Achieved')
 ax_cone.set_xlabel('Time (s)')
 ax_cone.set_ylabel('Approach angle $\\phi$ (deg)')
